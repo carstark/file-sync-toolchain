@@ -1,0 +1,9 @@
+# created by virtualenv automatically
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+*.tmp
+.sync/
+journal_*.json
+change_directive_*.json
