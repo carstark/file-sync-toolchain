@@ -43,6 +43,7 @@ IGNORE_PATTERNS = [
     '.Spotlight-V100',
     '.fseventsd',
     'desktop.ini',
+    '._',          # NEU: alle AppleDouble-Dateien ignorieren
 ]
 
 # ==============================================================================
@@ -53,6 +54,10 @@ def should_ignore(filepath: Path) -> bool:
     """Prüfe ob Datei/Ordner ignoriert werden soll."""
     name = filepath.name
     filepath_str = str(filepath)
+
+    # Alle dot-underscore Dateien ignorieren
+    if name.startswith('._'):
+        return True
 
     for pattern in IGNORE_PATTERNS:
         if pattern.startswith('*'):
@@ -181,8 +186,9 @@ def create_journal(folders: list[Path],
 
 
 def save_journal(journal: dict, output_path: Path) -> Path:
-    """Speichere Journal als JSON."""
-    output_path.write_text(json.dumps(journal, indent=2, ensure_ascii=False))
+    """Speichere Journal als JSON (UTF-8)."""
+    text = json.dumps(journal, indent=2, ensure_ascii=False)
+    output_path.write_text(text, encoding="utf-8")
     return output_path
 
 
