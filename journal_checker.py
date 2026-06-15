@@ -2,19 +2,23 @@
 """
 journal_checker.py - Vergleicht bis zu drei Journals (Mac, Win, USB)
 ======================================================================
-Eingabe:  Bis zu 3 Journal-JSON-Dateien aus current_journal.py
-Ausgabe:  change_directive_{timestamp}.json
+Version 2.0 – USB als Ground Truth
 
-Logik:
-  - Gleiche Dateien (Pfad + Größe + mtime identisch auf allen Quellen)
-    → still überspringen.
-  - Datei existiert nur auf einem Gerät (neu oder gelöscht)
-    → ACTION_COPY oder ACTION_DELETE (je nach Kontext).
-  - Datei existiert auf mehreren Geräten, aber Größe oder mtime abweichend
-    → CONFLICT → Nutzer muss entscheiden.
+USB ist der letzte bekannte gemeinsame Stand (Mittler).
+Mac und Win sind die Arbeitsflächen seit dem letzten Sync.
 
-Das Ergebnis ist ein strukturiertes change_directive, das Script 3
-(file_harvester.py) direkt einlesen kann.
+Aktionsklassen:
+  OK               – Überall identisch, kein Handlungsbedarf
+  COPY MAC         – Neu auf Mac, auf USB+Win kopieren
+  COPY WIN         – Neu auf Win, auf USB+Mac kopieren
+  COPY             – Neu auf beiden Rechnern, identisch → auf USB kopieren
+  DELETE           – Auf beiden Rechnern gelöscht → von USB entfernen
+  CONFLICT modified – Auf Mac UND Win geändert, aber unterschiedlich
+  CONFLICT new     – Neu auf Mac UND Win, aber unterschiedlich
+  CONFLICT del Mac – Auf Mac gelöscht, auf Win aber geändert (oder umgekehrt)
+  CONFLICT del Win – Auf Win gelöscht, auf Mac aber geändert (oder umgekehrt)
+
+Alle CONFLICT-Einträge enthalten 'needs_resolution': true für Script 4.
 """
 
 import json
@@ -28,91 +32,186 @@ from tkinter import filedialog, messagebox, ttk
 
 
 # ==============================================================================
-# DATENSTRUKTUREN
+# AKTIONSKLASSEN
 # ==============================================================================
 
-DEVICE_SLOTS = ["mac", "win", "usb"]  # logische Namen
+A_OK           = "OK"
+A_COPY_MAC     = "COPY MAC"
+A_COPY_WIN     = "COPY WIN"
+A_COPY         = "COPY"           # neu auf beiden, identisch
+A_DELETE       = "DELETE"         # auf beiden Rechnern gelöscht
+A_CONF_MOD     = "CONFLICT modified"
+A_CONF_NEW     = "CONFLICT new"
+A_CONF_DEL_MAC = "CONFLICT del Mac"
+A_CONF_DEL_WIN = "CONFLICT del Win"
 
-# Aktions-Konstanten
-ACTION_OK       = "OK"         # Überall identisch → kein Handlungsbedarf
-ACTION_COPY     = "COPY"       # Nur auf einer Quelle → auf fehlende Ziele kopieren
-ACTION_CONFLICT = "CONFLICT"   # Auf mehreren Quellen, aber unterschiedlich → Nutzer entscheiden
+# Sortierpriorität für die Tabelle (kleinste Zahl = oben)
+ACTION_ORDER = {
+    A_CONF_MOD:     0,
+    A_CONF_NEW:     1,
+    A_CONF_DEL_MAC: 2,
+    A_CONF_DEL_WIN: 3,
+    A_COPY_MAC:     4,
+    A_COPY_WIN:     5,
+    A_COPY:         6,
+    A_DELETE:       7,
+    A_OK:           8,
+}
+
+# Farben für die Treeview-Tabelle
+ACTION_COLORS = {
+    A_CONF_MOD:     "#fde8d8",   # orange
+    A_CONF_NEW:     "#fde8d8",
+    A_CONF_DEL_MAC: "#fde8d8",
+    A_CONF_DEL_WIN: "#fde8d8",
+    A_COPY_MAC:     "#d6eaf8",   # blau
+    A_COPY_WIN:     "#d6eaf8",
+    A_COPY:         "#d6eaf8",
+    A_DELETE:       "#fadbd8",   # rot
+    A_OK:           "#d5f5e3",   # grün
+}
+
+DEVICE_SLOTS = ["mac", "win", "usb"]
+
+MTIME_TOLERANCE = 2.0   # Sekunden – FAT32/exFAT rundet auf 2s
 
 
 # ==============================================================================
-# JOURNAL LESEN
+# HILFSFUNKTIONEN
 # ==============================================================================
 
 def load_journal(path: Path) -> dict:
-    """Liest ein Journal-JSON und gibt es als dict zurück."""
-    text = path.read_text(encoding="utf-8")
-    return json.loads(text)
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def flatten_journal(journal: dict) -> dict[str, dict]:
     """
-    Extrahiert aus dem Journal eine flache Datei-Map:
+    Gibt eine flache Map zurück:
     { "relativer/pfad/datei.ext": {"size": int, "mtime": float} }
-
-    Der relative Pfad kommt direkt aus dem Journal (so wie current_journal.py
-    ihn gesetzt hat: relativ zum gescannten Ordner).
     """
     flat = {}
-    for folder_abs, folder_data in journal.get("folders", {}).items():
+    for folder_data in journal.get("folders", {}).values():
         for rel_path, meta in folder_data.get("files", {}).items():
-            # Pfad-Separator normalisieren (Windows vs Unix)
             normalized = rel_path.replace("\\", "/")
-            flat[normalized] = {
-                "size":  meta["size"],
-                "mtime": meta["mtime"],
-            }
+            flat[normalized] = {"size": meta["size"], "mtime": meta["mtime"]}
     return flat
 
 
+def same(a: dict, b: dict) -> bool:
+    """Vergleicht zwei Metadaten-Einträge (Größe + mtime mit Toleranz)."""
+    return (
+        a["size"] == b["size"] and
+        abs(a["mtime"] - b["mtime"]) < MTIME_TOLERANCE
+    )
+
+
 # ==============================================================================
-# VERGLEICHSLOGIK
+# KERNLOGIK – USB ALS GROUND TRUTH
+# ==============================================================================
+
+def classify(presence: dict, per_source: dict, has_usb: bool) -> str:
+    """
+    Bestimmt die Aktionsklasse für eine Datei.
+
+    presence   = {"mac": bool, "win": bool, "usb": bool}
+    per_source = {slot: {"size":..,"mtime":..}} für vorhandene Slots
+    has_usb    = ob ein USB-Journal geladen ist
+    """
+    on_mac = presence.get("mac", False)
+    on_win = presence.get("win", False)
+    on_usb = presence.get("usb", False)
+
+    # ---------------------------------------------------------------
+    # Modus: alle drei Journals vorhanden
+    # ---------------------------------------------------------------
+    if has_usb:
+
+        # Alle drei vorhanden
+        if on_mac and on_win and on_usb:
+            mac_usb = same(per_source["mac"], per_source["usb"])
+            win_usb = same(per_source["win"], per_source["usb"])
+            if mac_usb and win_usb:
+                return A_OK
+            if mac_usb and not win_usb:
+                return A_COPY_WIN   # Win hat geändert → Win-Version verteilen
+            if win_usb and not mac_usb:
+                return A_COPY_MAC   # Mac hat geändert → Mac-Version verteilen
+            # Beide von USB abweichend
+            return A_CONF_MOD
+
+        # Nur auf USB (beide Rechner haben gelöscht)
+        if not on_mac and not on_win and on_usb:
+            return A_DELETE
+
+        # Neu auf Mac (nicht auf USB, nicht auf Win)
+        if on_mac and not on_win and not on_usb:
+            return A_COPY_MAC
+
+        # Neu auf Win (nicht auf USB, nicht auf Mac)
+        if not on_mac and on_win and not on_usb:
+            return A_COPY_WIN
+
+        # Neu auf beiden, aber nicht auf USB
+        if on_mac and on_win and not on_usb:
+            if same(per_source["mac"], per_source["win"]):
+                return A_COPY       # identisch → einfach auf USB
+            return A_CONF_NEW       # verschieden → Nutzer entscheiden
+
+        # Auf Mac + USB, aber nicht auf Win
+        if on_mac and not on_win and on_usb:
+            mac_usb = same(per_source["mac"], per_source["usb"])
+            if mac_usb:
+                # Win hat gelöscht, Mac ist unverändert → echte Löschung auf Win
+                return A_CONF_DEL_WIN   # sicher melden, User bestätigt
+            else:
+                # Mac hat geändert UND Win hat gelöscht → echter Konflikt
+                return A_CONF_DEL_WIN
+
+        # Auf Win + USB, aber nicht auf Mac
+        if not on_mac and on_win and on_usb:
+            win_usb = same(per_source["win"], per_source["usb"])
+            if win_usb:
+                return A_CONF_DEL_MAC
+            else:
+                return A_CONF_DEL_MAC
+
+        # Fallback (sollte nicht vorkommen)
+        return A_CONF_MOD
+
+    # ---------------------------------------------------------------
+    # Modus: nur zwei Journals (ohne USB)
+    # ---------------------------------------------------------------
+    else:
+        # Beide vorhanden
+        if on_mac and on_win:
+            if same(per_source["mac"], per_source["win"]):
+                return A_OK
+            return A_CONF_MOD
+
+        if on_mac and not on_win:
+            return A_COPY_MAC
+
+        if not on_mac and on_win:
+            return A_COPY_WIN
+
+        return A_CONF_MOD  # Fallback
+
+
+# ==============================================================================
+# VERGLEICH
 # ==============================================================================
 
 def compare_journals(journals: dict[str, dict]) -> dict:
     """
-    Vergleicht die übergebenen Journals.
-
-    journals = {
-        "mac": <journal_dict>,
-        "win": <journal_dict>,   # optional
-        "usb": <journal_dict>,   # optional
-    }
-
-    Gibt ein change_directive zurück:
-    {
-        "meta": { ... },
-        "sources": { "mac": {...}, "win": {...}, ... },
-        "entries": [
-            {
-                "rel_path": "...",
-                "action": "OK" | "COPY" | "CONFLICT",
-                "presence": { "mac": True/False, "win": True/False, ... },
-                "per_source": { "mac": {"size":..,"mtime":..}, ... },
-                "resolution": null,   # wird von Script 3/4 befüllt
-            },
-            ...
-        ],
-        "summary": {
-            "total_files":   int,
-            "ok":            int,
-            "copy":          int,
-            "conflict":      int,
-        }
-    }
+    Vergleicht die übergebenen Journals und gibt ein change_directive zurück.
     """
+    has_usb = "usb" in journals
     slot_names = list(journals.keys())
 
-    # Journals flach machen
     flat: dict[str, dict[str, dict]] = {
         slot: flatten_journal(j) for slot, j in journals.items()
     }
 
-    # Alle bekannten Pfade sammeln
     all_paths: set[str] = set()
     for files in flat.values():
         all_paths.update(files.keys())
@@ -124,59 +223,51 @@ def compare_journals(journals: dict[str, dict]) -> dict:
         per_source = {slot: flat[slot][rel_path]
                       for slot in slot_names if rel_path in flat[slot]}
 
-        present_slots = [s for s, p in presence.items() if p]
-
-        # --- Überall gleich? ---
-        if len(present_slots) == len(slot_names):
-            # Datei ist auf allen Quellen vorhanden → Werte vergleichen
-            values = list(per_source.values())
-            all_same = all(
-                v["size"] == values[0]["size"] and
-                abs(v["mtime"] - values[0]["mtime"]) < 2.0   # 2s Toleranz für FAT32/exFAT
-                for v in values
-            )
-            if all_same:
-                action = ACTION_OK
-            else:
-                action = ACTION_CONFLICT
-        elif len(present_slots) == 1:
-            # Nur auf einer Quelle → Kopieraktion
-            action = ACTION_COPY
-        else:
-            # Auf mehreren, aber nicht allen Quellen → Konflikt
-            action = ACTION_CONFLICT
+        action = classify(presence, per_source, has_usb)
 
         entry = {
-            "rel_path":   rel_path,
-            "action":     action,
-            "presence":   presence,
-            "per_source": per_source,
-            "resolution": None,  # Platzhalter für Script 4
+            "rel_path":        rel_path,
+            "action":          action,
+            "needs_resolution": action.startswith("CONFLICT"),
+            "presence":        presence,
+            "per_source":      per_source,
+            "resolution":      None,   # befüllt durch Script 4
         }
         entries.append(entry)
 
-    # --- Zusammenfassung ---
+    # Zusammenfassung
+    all_actions = [e["action"] for e in entries]
     summary = {
-        "total_files": len(entries),
-        "ok":          sum(1 for e in entries if e["action"] == ACTION_OK),
-        "copy":        sum(1 for e in entries if e["action"] == ACTION_COPY),
-        "conflict":    sum(1 for e in entries if e["action"] == ACTION_CONFLICT),
+        "total_files":      len(entries),
+        "ok":               all_actions.count(A_OK),
+        "copy_mac":         all_actions.count(A_COPY_MAC),
+        "copy_win":         all_actions.count(A_COPY_WIN),
+        "copy":             all_actions.count(A_COPY),
+        "delete":           all_actions.count(A_DELETE),
+        "conflict_modified":  all_actions.count(A_CONF_MOD),
+        "conflict_new":       all_actions.count(A_CONF_NEW),
+        "conflict_del_mac":   all_actions.count(A_CONF_DEL_MAC),
+        "conflict_del_win":   all_actions.count(A_CONF_DEL_WIN),
+        "total_conflicts":  sum(1 for e in entries if e["needs_resolution"]),
+        "total_copies":     sum(1 for e in entries
+                                if e["action"] in (A_COPY_MAC, A_COPY_WIN, A_COPY)),
     }
 
-    # --- Quell-Metadaten ---
-    sources_meta = {}
-    for slot, j in journals.items():
-        sources_meta[slot] = {
+    sources_meta = {
+        slot: {
             "device":    j.get("device", "?"),
             "timestamp": j.get("timestamp", "?"),
             "files":     j.get("summary", {}).get("total_files", 0),
         }
+        for slot, j in journals.items()
+    }
 
-    directive = {
+    return {
         "meta": {
-            "created":  datetime.now().isoformat(),
-            "tool":     "journal_checker.py",
-            "version":  "1.0",
+            "created": datetime.now().isoformat(),
+            "tool":    "journal_checker.py",
+            "version": "2.0",
+            "usb_as_ground_truth": has_usb,
         },
         "sources":  sources_meta,
         "slots":    slot_names,
@@ -184,13 +275,12 @@ def compare_journals(journals: dict[str, dict]) -> dict:
         "summary":  summary,
     }
 
-    return directive
-
 
 def save_directive(directive: dict, output_path: Path) -> Path:
-    """Speichert die change_directive als JSON (UTF-8)."""
-    text = json.dumps(directive, indent=2, ensure_ascii=False)
-    output_path.write_text(text, encoding="utf-8")
+    output_path.write_text(
+        json.dumps(directive, indent=2, ensure_ascii=False),
+        encoding="utf-8"
+    )
     return output_path
 
 
@@ -199,25 +289,21 @@ def save_directive(directive: dict, output_path: Path) -> Path:
 # ==============================================================================
 
 class CheckerApp:
-    """tkinter GUI für journal_checker."""
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("🔍 Journal Checker")
-        self.root.geometry("800x660")
+        self.root.title("🔍 Journal Checker v2")
+        self.root.geometry("900x700")
         self.root.resizable(True, True)
 
-        # Journal-Pfade je Slot (mac, win, usb)
-        self.journal_vars: dict[str, tk.StringVar] = {
-            slot: tk.StringVar() for slot in DEVICE_SLOTS
-        }
+        self.journal_vars = {slot: tk.StringVar() for slot in DEVICE_SLOTS}
         self.save_dir_var = tk.StringVar(value=str(Path.home()))
-        self.cancel_event = threading.Event()
+        self._directive   = None
 
         self._build_ui()
 
     # ------------------------------------------------------------------
-    # UI-Aufbau
+    # UI
     # ------------------------------------------------------------------
 
     def _build_ui(self):
@@ -225,25 +311,24 @@ class CheckerApp:
         header = tk.Frame(self.root, bg="#2c3e50", height=60)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
-        tk.Label(header, text="🔍 Journal Checker – Vergleich",
-                 font=("Helvetica", 16, "bold"),
+        tk.Label(header, text="🔍 Journal Checker – USB als Ground Truth",
+                 font=("Helvetica", 15, "bold"),
                  bg="#2c3e50", fg="white").pack(pady=15)
 
         # Journal-Auswahl
         sel_frame = tk.LabelFrame(self.root, text="Journals auswählen",
-                                  padx=10, pady=10)
-        sel_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+                                  padx=10, pady=8)
+        sel_frame.pack(fill=tk.X, padx=10, pady=(10, 4))
 
-        labels = {"mac": "Mac  ", "win": "Win  ", "usb": "USB  "}
+        labels = {"mac": "Mac ", "win": "Win ", "usb": "USB "}
         for slot in DEVICE_SLOTS:
             row = tk.Frame(sel_frame)
-            row.pack(fill=tk.X, pady=3)
+            row.pack(fill=tk.X, pady=2)
             tk.Label(row, text=f"{labels[slot]}:",
-                     font=("Helvetica", 11, "bold"), width=6,
-                     anchor="w").pack(side=tk.LEFT)
+                     font=("Helvetica", 11, "bold"),
+                     width=5, anchor="w").pack(side=tk.LEFT)
             tk.Entry(row, textvariable=self.journal_vars[slot],
-                     font=("Courier", 9)).pack(side=tk.LEFT,
-                                               fill=tk.X, expand=True)
+                     font=("Courier", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True)
             tk.Button(row, text="📂",
                       command=lambda s=slot: self._pick_journal(s),
                       width=3).pack(side=tk.LEFT, padx=(4, 0))
@@ -251,60 +336,58 @@ class CheckerApp:
                       command=lambda s=slot: self.journal_vars[s].set(""),
                       width=3).pack(side=tk.LEFT, padx=2)
 
-        tk.Label(sel_frame, text="(Mindestens 2 Journals erforderlich. "
-                                  "Leere Felder werden ignoriert.)",
-                 font=("Helvetica", 9), fg="#555").pack(anchor="w", pady=(6, 0))
+        tk.Label(sel_frame,
+                 text="USB ist Ground Truth. Mac/Win sind die Arbeitsflächen. "
+                      "Min. 2 Journals erforderlich.",
+                 font=("Helvetica", 9), fg="#555").pack(anchor="w", pady=(4, 0))
 
         # Speicherort
-        save_frame = tk.LabelFrame(self.root, text="Speicherort für change_directive",
-                                   padx=10, pady=5)
-        save_frame.pack(fill=tk.X, padx=10, pady=5)
-
+        save_frame = tk.LabelFrame(self.root,
+                                   text="Speicherort für change_directive",
+                                   padx=10, pady=4)
+        save_frame.pack(fill=tk.X, padx=10, pady=4)
         tk.Entry(save_frame, textvariable=self.save_dir_var,
                  font=("Courier", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True)
         tk.Button(save_frame, text="📂",
                   command=self._choose_save_dir,
-                  width=3).pack(side=tk.RIGHT, padx=5)
+                  width=3).pack(side=tk.RIGHT, padx=4)
 
-        # Ergebnis-Tabelle (Notebook mit zwei Tabs)
-        result_nb = ttk.Notebook(self.root)
-        result_nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        # Notebook: Zusammenfassung + Einträge
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
 
         # Tab 1: Zusammenfassung
-        self.summary_text = tk.Text(result_nb, font=("Courier", 10),
-                                    state=tk.DISABLED, height=6)
-        result_nb.add(self.summary_text, text="Zusammenfassung")
+        self.summary_text = tk.Text(nb, font=("Courier", 10),
+                                    state=tk.DISABLED)
+        nb.add(self.summary_text, text="Zusammenfassung")
 
         # Tab 2: Einträge
-        tree_frame = tk.Frame(result_nb)
-        result_nb.add(tree_frame, text="Einträge")
+        tree_frame = tk.Frame(nb)
+        nb.add(tree_frame, text="Einträge")
 
-        columns = ("action", "presence", "rel_path")
-        self.tree = ttk.Treeview(tree_frame, columns=columns,
+        cols = ("action", "presence", "rel_path")
+        self.tree = ttk.Treeview(tree_frame, columns=cols,
                                  show="headings", selectmode="browse")
         self.tree.heading("action",   text="Aktion")
         self.tree.heading("presence", text="Quellen")
         self.tree.heading("rel_path", text="Relativer Pfad")
-        self.tree.column("action",   width=90,  anchor="center", stretch=False)
-        self.tree.column("presence", width=130, anchor="center", stretch=False)
-        self.tree.column("rel_path", width=560)
+        self.tree.column("action",   width=160, anchor="center", stretch=False)
+        self.tree.column("presence", width=140, anchor="center", stretch=False)
+        self.tree.column("rel_path", width=580)
 
         vsb = ttk.Scrollbar(tree_frame, orient="vertical",
                              command=self.tree.yview)
         hsb = ttk.Scrollbar(tree_frame, orient="horizontal",
                              command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        vsb.pack(side=tk.RIGHT,  fill=tk.Y)
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
         self.tree.pack(fill=tk.BOTH, expand=True)
 
-        # Farben für Aktionen
-        self.tree.tag_configure("OK",       background="#d5f5e3")
-        self.tree.tag_configure("COPY",     background="#d6eaf8")
-        self.tree.tag_configure("CONFLICT", background="#fde8d8")
+        for action, color in ACTION_COLORS.items():
+            self.tree.tag_configure(action, background=color)
 
-        # Statuszeile
+        # Statusleiste
         self.status_var = tk.StringVar(value="Bereit.")
         tk.Label(self.root, textvariable=self.status_var,
                  anchor="w", font=("Helvetica", 10),
@@ -328,10 +411,8 @@ class CheckerApp:
                                    height=2, width=22)
         self.save_btn.pack(side=tk.LEFT, padx=5)
 
-        self._directive = None  # wird nach Vergleich befüllt
-
     # ------------------------------------------------------------------
-    # Datei-Auswahl
+    # Datei-Picker
     # ------------------------------------------------------------------
 
     def _pick_journal(self, slot: str):
@@ -355,7 +436,6 @@ class CheckerApp:
     # ------------------------------------------------------------------
 
     def _start_check(self):
-        # Journals einlesen
         journals = {}
         for slot in DEVICE_SLOTS:
             p = self.journal_vars[slot].get().strip()
@@ -363,14 +443,13 @@ class CheckerApp:
                 continue
             path = Path(p)
             if not path.is_file():
-                messagebox.showerror("Fehler",
-                                     f"Journal nicht gefunden:\n{p}")
+                messagebox.showerror("Fehler", f"Journal nicht gefunden:\n{p}")
                 return
             try:
                 journals[slot] = load_journal(path)
             except Exception as exc:
                 messagebox.showerror("Lesefehler",
-                                     f"Konnte {path.name} nicht lesen:\n{exc}")
+                                     f"Konnte {Path(p).name} nicht lesen:\n{exc}")
                 return
 
         if len(journals) < 2:
@@ -379,16 +458,15 @@ class CheckerApp:
             return
 
         self.run_btn.config(state=tk.DISABLED)
-        self.status_var.set("⏳ Vergleiche Journals …")
-        self._directive = None
         self.save_btn.config(state=tk.DISABLED)
+        self._directive = None
+        self.status_var.set("⏳ Vergleiche Journals …")
 
-        thread = threading.Thread(
+        threading.Thread(
             target=self._run_check, args=(journals,), daemon=True
-        )
-        thread.start()
+        ).start()
 
-    def _run_check(self, journals: dict):
+    def _run_check(self, journals):
         try:
             directive = compare_journals(journals)
         except Exception as exc:
@@ -397,50 +475,65 @@ class CheckerApp:
             ))
             self.root.after(0, lambda: self.run_btn.config(state=tk.NORMAL))
             return
-
         self.root.after(0, lambda: self._show_results(directive))
 
     def _show_results(self, directive: dict):
         self._directive = directive
-        summary = directive["summary"]
+        s  = directive["summary"]
+        sr = directive["sources"]
 
-        # Zusammenfassung
-        s = directive["sources"]
+        # Zusammenfassung aufbauen
         lines = ["Verglichene Quellen:"]
-        for slot, meta in s.items():
+        for slot, meta in sr.items():
             lines.append(
-                f"  {slot.upper():4s}  Gerät: {meta['device']:<20s}  "
-                f"Dateien: {meta['files']:>6,}  "
+                f"  {slot.upper():4s}  Gerät: {meta['device']:<22s}  "
+                f"Dateien: {meta['files']:>7,}  "
                 f"Stand: {meta['timestamp'][:19]}"
             )
+
+        usb_hint = ("✔ USB als Ground Truth aktiv"
+                    if directive["meta"]["usb_as_ground_truth"]
+                    else "⚠ Kein USB-Journal – symmetrischer Vergleich")
+
         lines += [
             "",
-            f"Gesamt:    {summary['total_files']:>7,}  Dateien",
-            f"OK:        {summary['ok']:>7,}  (überall identisch)",
-            f"COPY:      {summary['copy']:>7,}  (fehlt auf mindestens einer Quelle)",
-            f"CONFLICT:  {summary['conflict']:>7,}  (abweichende Version)",
+            usb_hint,
+            "",
+            f"Gesamt:              {s['total_files']:>7,}",
+            f"OK:                  {s['ok']:>7,}",
+            f"─" * 38,
+            f"COPY MAC:            {s['copy_mac']:>7,}",
+            f"COPY WIN:            {s['copy_win']:>7,}",
+            f"COPY (beide gleich): {s['copy']:>7,}",
+            f"DELETE:              {s['delete']:>7,}",
+            f"─" * 38,
+            f"CONFLICT modified:   {s['conflict_modified']:>7,}",
+            f"CONFLICT new:        {s['conflict_new']:>7,}",
+            f"CONFLICT del Mac:    {s['conflict_del_mac']:>7,}",
+            f"CONFLICT del Win:    {s['conflict_del_win']:>7,}",
+            f"─" * 38,
+            f"Gesamt Conflicts:    {s['total_conflicts']:>7,}",
+            f"Gesamt Copies:       {s['total_copies']:>7,}",
         ]
+
         self.summary_text.config(state=tk.NORMAL)
         self.summary_text.delete("1.0", tk.END)
         self.summary_text.insert(tk.END, "\n".join(lines))
         self.summary_text.config(state=tk.DISABLED)
 
-        # Tabelle füllen (OK-Einträge zuletzt, damit COPYs + CONFLICTs oben stehen)
+        # Tabelle füllen
         self.tree.delete(*self.tree.get_children())
         slot_names = directive["slots"]
 
-        def presence_str(presence: dict) -> str:
-            parts = []
-            for slot in slot_names:
-                icon = "✔" if presence.get(slot) else "✖"
-                parts.append(f"{slot}:{icon}")
-            return "  ".join(parts)
+        def presence_str(presence):
+            return "  ".join(
+                f"{sl}:{'✔' if presence.get(sl) else '✖'}"
+                for sl in slot_names
+            )
 
-        # Sortierung: CONFLICT → COPY → OK
-        order = {ACTION_CONFLICT: 0, ACTION_COPY: 1, ACTION_OK: 2}
         sorted_entries = sorted(
             directive["entries"],
-            key=lambda e: (order[e["action"]], e["rel_path"])
+            key=lambda e: (ACTION_ORDER.get(e["action"], 99), e["rel_path"])
         )
 
         for entry in sorted_entries:
@@ -455,10 +548,11 @@ class CheckerApp:
             )
 
         self.status_var.set(
-            f"✅ Vergleich abgeschlossen – "
-            f"OK: {summary['ok']}  |  "
-            f"COPY: {summary['copy']}  |  "
-            f"CONFLICT: {summary['conflict']}"
+            f"✅ Abgeschlossen – "
+            f"OK: {s['ok']}  |  "
+            f"Copies: {s['total_copies']}  |  "
+            f"Conflicts: {s['total_conflicts']}  |  "
+            f"Delete: {s['delete']}"
         )
         self.run_btn.config(state=tk.NORMAL)
         self.save_btn.config(state=tk.NORMAL)
@@ -470,21 +564,16 @@ class CheckerApp:
     def _save_directive(self):
         if not self._directive:
             return
-
-        ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        ts       = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         filename = f"change_directive_{ts}.json"
-        output_path = Path(self.save_dir_var.get()) / filename
-
+        out_path = Path(self.save_dir_var.get()) / filename
         try:
-            save_directive(self._directive, output_path)
+            save_directive(self._directive, out_path)
         except Exception as exc:
             messagebox.showerror("Speicherfehler", str(exc))
             return
-
-        messagebox.showinfo(
-            "Gespeichert",
-            f"change_directive gespeichert:\n\n{output_path}"
-        )
+        messagebox.showinfo("Gespeichert",
+                            f"change_directive gespeichert:\n\n{out_path}")
         self.status_var.set(f"💾 Gespeichert: {filename}")
 
     def run(self):
@@ -492,63 +581,56 @@ class CheckerApp:
 
 
 # ==============================================================================
-# CLI MODE
+# CLI
 # ==============================================================================
 
 def cli_mode(args: list[str]):
-    """
-    Kommandozeilen-Modus.
-
-    Beispiel:
-        python journal_checker.py \\
-            --mac journal_MacBook_2025.json \\
-            --win journal_WinPC_2025.json \\
-            --usb journal_USB_2025.json \\
-            --output /path/to/output/
-    """
     import argparse
-
     parser = argparse.ArgumentParser(
-        description="journal_checker.py – Vergleicht bis zu 3 Journals"
+        description="journal_checker.py v2 – USB als Ground Truth"
     )
-    parser.add_argument("--mac",    help="Journal-Datei für Mac")
-    parser.add_argument("--win",    help="Journal-Datei für Windows")
-    parser.add_argument("--usb",    help="Journal-Datei für USB")
-    parser.add_argument("--output", help="Ausgabeordner (Standard: aktuelles Verzeichnis)")
-
+    parser.add_argument("--mac",    help="Journal Mac")
+    parser.add_argument("--win",    help="Journal Windows")
+    parser.add_argument("--usb",    help="Journal USB (Ground Truth)")
+    parser.add_argument("--output", help="Ausgabeordner")
     parsed = parser.parse_args(args)
 
     journals = {}
-    slot_map = {"mac": parsed.mac, "win": parsed.win, "usb": parsed.usb}
-    for slot, path_str in slot_map.items():
+    for slot, path_str in {"mac": parsed.mac,
+                            "win": parsed.win,
+                            "usb": parsed.usb}.items():
         if path_str:
             p = Path(path_str)
             if not p.is_file():
-                print(f"❌ Datei nicht gefunden: {p}")
-                sys.exit(1)
+                print(f"❌ Nicht gefunden: {p}"); sys.exit(1)
             print(f"📖 Lese {slot.upper()}: {p.name}")
             journals[slot] = load_journal(p)
 
     if len(journals) < 2:
-        print("❌ Mindestens 2 Journals erforderlich.")
-        sys.exit(1)
+        print("❌ Mindestens 2 Journals erforderlich."); sys.exit(1)
 
     print("\n⏳ Vergleiche …")
     directive = compare_journals(journals)
     s = directive["summary"]
 
-    print(f"\n{'='*60}")
-    print(f"  Gesamt:    {s['total_files']:>7,}")
-    print(f"  OK:        {s['ok']:>7,}")
-    print(f"  COPY:      {s['copy']:>7,}")
-    print(f"  CONFLICT:  {s['conflict']:>7,}")
-    print(f"{'='*60}")
+    print(f"\n{'='*45}")
+    print(f"  Gesamt:              {s['total_files']:>7,}")
+    print(f"  OK:                  {s['ok']:>7,}")
+    print(f"  COPY MAC:            {s['copy_mac']:>7,}")
+    print(f"  COPY WIN:            {s['copy_win']:>7,}")
+    print(f"  COPY (beide gleich): {s['copy']:>7,}")
+    print(f"  DELETE:              {s['delete']:>7,}")
+    print(f"  CONFLICT modified:   {s['conflict_modified']:>7,}")
+    print(f"  CONFLICT new:        {s['conflict_new']:>7,}")
+    print(f"  CONFLICT del Mac:    {s['conflict_del_mac']:>7,}")
+    print(f"  CONFLICT del Win:    {s['conflict_del_win']:>7,}")
+    print(f"{'='*45}")
 
-    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    out_dir = Path(parsed.output) if parsed.output else Path.cwd()
-    output_path = out_dir / f"change_directive_{ts}.json"
-    save_directive(directive, output_path)
-    print(f"\n✅ Gespeichert: {output_path}")
+    ts       = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    out_dir  = Path(parsed.output) if parsed.output else Path.cwd()
+    out_path = out_dir / f"change_directive_{ts}.json"
+    save_directive(directive, out_path)
+    print(f"\n✅ Gespeichert: {out_path}")
 
 
 # ==============================================================================
