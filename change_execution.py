@@ -971,31 +971,34 @@ class ExecutionApp:
     # ---- COPY ----
 
     def _run_copy(self, done_keys, ok, pend, err):
+        slot_map = {
+            "COPY MAC": ("win", [("Win", self._win_roots),
+                                 ("USB", self._usb_roots)]),
+            "COPY WIN": ("mac", [("Mac", self._mac_roots),
+                                 ("USB", self._usb_roots)]),
+            "COPY":     ("both",[("USB", self._usb_roots)]),
+        }
+
         for entry in self._copy_entries:
             rel = entry["rel_path"]
             act = entry["action"]
-            src = longpath(Path(entry.get("dst", "")))  # staged auf USB
+
+            if act not in slot_map:
+                continue
+
+            staging_slot, targets = slot_map[act]
+
+            # Quelle: immer relativ zu harvest_root/staging/<slot>/
+            # NICHT über dst-Pfad aus harvest_report (plattformabhängig)
+            src = longpath(self._harvest_root / "staging" / staging_slot / rel)
 
             if not src.is_file():
-                self._log(f"MISS staging  {rel[:65]}")
-                er = self._exec_report
-                er.upsert(rel, act, "error", act, "copy",
-                          error="staging-Datei nicht gefunden")
+                self._log(f"MISS staging/{staging_slot}  {rel[:65]}")
+                self._exec_report.upsert(rel, act, "error", act, "copy",
+                                         error=f"staging/{staging_slot} nicht gefunden")
                 err += 1
                 continue
 
-            # Ziele bestimmen
-            targets: list[tuple[str, list[str]]] = []
-            if act == "COPY MAC":
-                targets = [("Win", self._win_roots),
-                           ("USB", self._usb_roots)]
-            elif act == "COPY WIN":
-                targets = [("Mac", self._mac_roots),
-                           ("USB", self._usb_roots)]
-            elif act == "COPY":
-                targets = [("USB", self._usb_roots)]
-
-            all_ok = True
             any_pend = False
             for label, roots in targets:
                 key = f"{rel}::{act}::{label}"
@@ -1006,13 +1009,11 @@ class ExecutionApp:
                     self._exec_report.upsert(rel, f"{act}::{label}",
                         "pending", act, "copy")
                     any_pend = True
-                    all_ok   = False
                     continue
-                dst_root = roots[0]
-                dst      = Path(dst_root) / rel
+                dst    = Path(roots[0]) / rel
                 c_ok, info = copy_verified(src, dst)
                 if c_ok:
-                    self._log(f"OK   COPY→{label}  {rel[:55]}")
+                    self._log(f"OK   COPY→{label}  {rel[:58]}")
                     self._exec_report.upsert(rel, f"{act}::{label}",
                         "ok", act, "copy")
                     ok += 1
@@ -1021,7 +1022,6 @@ class ExecutionApp:
                     self._exec_report.upsert(rel, f"{act}::{label}",
                         "error", act, "copy", error=info)
                     err  += 1
-                    all_ok = False
 
             if any_pend:
                 pend += 1
@@ -1076,8 +1076,21 @@ class ExecutionApp:
                             err += 1
 
             elif dec == "restore":
-                # Wiederherstellen von USB auf den Rechner der gelöscht hat
-                src = longpath(Path(entry.get("dst", "")))
+                # Wiederherstellen von USB/_GELOESCHT → auf den Rechner der gelöscht hat
+                # Pfad relativ zu harvest_root/_GELOESCHT/<datum>/<sub>/<rel>
+                geloescht_root = self._harvest_root / "_GELOESCHT"
+                sub_folder = "del_win" if act == "CONFLICT del Win" else "del_mac"
+                # Datum-Unterordner suchen (neuester)
+                src = None
+                if geloescht_root.is_dir():
+                    dated = sorted([d for d in geloescht_root.iterdir()
+                                    if d.is_dir()], reverse=True)
+                    for dated_dir in dated:
+                        candidate = longpath(dated_dir / sub_folder / rel)
+                        if candidate.is_file():
+                            src = candidate
+                            break
+
                 targets = []
                 if act == "CONFLICT del Win":
                     targets = [("Win", self._win_roots)]
@@ -1088,11 +1101,11 @@ class ExecutionApp:
                     ekey = f"{rel}::restore::{label}"
                     if ekey in done_keys:
                         continue
-                    if not src.is_file():
+                    if src is None or not src.is_file():
                         self._log(f"MISS restore-Quelle  {rel[:60]}")
                         self._exec_report.upsert(rel, f"restore::{label}",
                             "error", act, dec,
-                            error="Quelle nicht gefunden")
+                            error="Quelle in _GELOESCHT nicht gefunden")
                         err += 1
                         continue
                     if not roots_reachable(roots):
