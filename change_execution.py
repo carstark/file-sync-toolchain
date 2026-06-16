@@ -972,11 +972,11 @@ class ExecutionApp:
 
     def _run_copy(self, done_keys, ok, pend, err):
         slot_map = {
-            "COPY MAC": ("win", [("Win", self._win_roots),
-                                 ("USB", self._usb_roots)]),
-            "COPY WIN": ("mac", [("Mac", self._mac_roots),
-                                 ("USB", self._usb_roots)]),
-            "COPY":     ("both",[("USB", self._usb_roots)]),
+            "COPY MAC": ("mac",  [("Win", self._win_roots),
+                                  ("USB", self._usb_roots)]),
+            "COPY WIN": ("win",  [("Mac", self._mac_roots),
+                                  ("USB", self._usb_roots)]),
+            "COPY":     ("both", [("USB", self._usb_roots)]),
         }
 
         for entry in self._copy_entries:
