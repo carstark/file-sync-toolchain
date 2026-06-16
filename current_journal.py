@@ -25,8 +25,12 @@ from tkinter import filedialog, messagebox
 # ==============================================================================
 
 DEVICE_NAME = platform.node()
-TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-JOURNAL_FILENAME = f"journal_{DEVICE_NAME}_{TIMESTAMP}.json"
+
+SLOT_TYPES = ["MAC", "WIN", "USB"]
+
+def make_journal_filename(slot_type: str) -> str:
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    return f"journal_{slot_type}_{ts}.json"
 
 # Dateien/Ordner, die ignoriert werden
 IGNORE_PATTERNS = [
@@ -124,6 +128,7 @@ def scan_folder(folder_path: Path,
 # ==============================================================================
 
 def create_journal(folders: list[Path],
+                   slot_type: str = "MAC",
                    folder_progress_callback=None,
                    file_progress_callback=None,
                    cancel_event=None) -> dict:
@@ -134,12 +139,13 @@ def create_journal(folders: list[Path],
         dict: Das komplette Journal als Dictionary
     """
     journal = {
-        'device': DEVICE_NAME,
-        'timestamp': datetime.now().isoformat(),
+        'device':         DEVICE_NAME,
+        'slot_type':      slot_type,       # MAC | WIN | USB
+        'timestamp':      datetime.now().isoformat(),
         'hash_algorithm': 'none',
-        'folders': {},
+        'folders':        {},
         'summary': {
-            'total_files': 0,
+            'total_files':      0,
             'total_size_bytes': 0,
         }
     }
@@ -202,11 +208,12 @@ class JournalApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(f"📁 Current Journal - {DEVICE_NAME}")
-        self.root.geometry("750x600")
+        self.root.geometry("750x620")
         self.root.resizable(True, True)
 
         self.selected_folders: list[str] = []
         self.cancel_event = threading.Event()
+        self.slot_type_var = tk.StringVar(value="MAC")
 
         self._build_ui()
 
@@ -268,6 +275,43 @@ class JournalApp:
         tk.Button(save_frame, text="📂 USB wählen",
                   command=self._choose_save_dir,
                   width=14).pack(side=tk.RIGHT, padx=5)
+
+        # --- Slot-Typ ---
+        slot_frame = tk.LabelFrame(
+            self.root,
+            text="Dieses Journal gehört zu ...",
+            padx=10, pady=6)
+        slot_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
+
+        tk.Label(slot_frame,
+                 text="Slot-Typ:",
+                 font=("Helvetica", 11)).pack(side=tk.LEFT, padx=(0, 8))
+
+        for slot in SLOT_TYPES:
+            tk.Radiobutton(
+                slot_frame,
+                text=slot,
+                variable=self.slot_type_var,
+                value=slot,
+                font=("Helvetica", 11, "bold"),
+                padx=12,
+            ).pack(side=tk.LEFT)
+
+        self.filename_preview_var = tk.StringVar(value="")
+        tk.Label(slot_frame, textvariable=self.filename_preview_var,
+                 font=("Courier", 9), fg="#888"
+                 ).pack(side=tk.LEFT, padx=(20, 0))
+
+        # Vorschau aktualisieren wenn Slot wechselt
+        self.slot_type_var.trace_add(
+            "write",
+            lambda *_: self.filename_preview_var.set(
+                f"→  {make_journal_filename(self.slot_type_var.get())}"
+            )
+        )
+        self.filename_preview_var.set(
+            f"→  {make_journal_filename(self.slot_type_var.get())}"
+        )
 
         # --- Fortschritt (nur Text) ---
         progress_frame = tk.LabelFrame(self.root, text="Fortschritt", padx=10, pady=5)
@@ -389,7 +433,8 @@ class JournalApp:
 
     def _run_scan(self):
         """Scan-Thread"""
-        folders = [Path(f) for f in self.selected_folders]
+        folders    = [Path(f) for f in self.selected_folders]
+        slot_type  = self.slot_type_var.get()
         start_time = time.time()
 
         def folder_progress(current, total, name):
@@ -404,6 +449,7 @@ class JournalApp:
 
         journal = create_journal(
             folders=folders,
+            slot_type=slot_type,
             folder_progress_callback=folder_progress,
             file_progress_callback=file_progress,
             cancel_event=self.cancel_event
@@ -412,8 +458,9 @@ class JournalApp:
         if self.cancel_event.is_set():
             return
 
-        # Speichern
-        output_path = Path(self.save_dir_var.get()) / JOURNAL_FILENAME
+        # Speichern – Dateiname enthält Slot-Typ (MAC/WIN/USB)
+        filename    = make_journal_filename(slot_type)
+        output_path = Path(self.save_dir_var.get()) / filename
         save_journal(journal, output_path)
 
         elapsed = time.time() - start_time
