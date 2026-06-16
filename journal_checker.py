@@ -295,17 +295,16 @@ class CheckerApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("🔍 Journal Checker v2")
-        self.root.geometry("900x740")
+        self.root.geometry("900x780")
         self.root.resizable(True, True)
 
-        self.journal_vars      = {slot: tk.StringVar() for slot in DEVICE_SLOTS}
-        self._directive        = None
-        self._auto_save_dir    = None
+        self.journal_vars                = {slot: tk.StringVar() for slot in DEVICE_SLOTS}
+        self._directive                  = None
+        self._auto_save_dir: Path | None = None
         self._available_journals: list[Path] = []
-        self._sync_dir: Path | None = None
+        self._usb_root: Path | None      = None
 
         self._build_ui()
-        self._auto_find_journals()
 
     # ------------------------------------------------------------------
     # UI
@@ -320,8 +319,26 @@ class CheckerApp:
                  font=("Helvetica", 15, "bold"),
                  bg="#2c3e50", fg="white").pack(pady=15)
 
+        # USB-Laufwerk – erster Schritt, alles andere hängt davon ab
+        usb_frame = tk.LabelFrame(
+            self.root,
+            text="Schritt 1 – USB-Laufwerk identifizieren",
+            padx=10, pady=8)
+        usb_frame.pack(fill=tk.X, padx=10, pady=(10, 4))
+
+        self.usb_display_var = tk.StringVar(value="(noch nicht gewählt)")
+        tk.Label(usb_frame, textvariable=self.usb_display_var,
+                 font=("Courier", 9), anchor="w", fg="#c0392b"
+                 ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(usb_frame, text="📂  USB-Laufwerk wählen",
+                  command=self._pick_usb_root,
+                  font=("Helvetica", 10, "bold"),
+                  bg="#1a5276", fg="white",
+                  width=24).pack(side=tk.RIGHT, padx=4)
+
         # Journal-Auswahl – zweigeteilt: Listbox links, Zuordnung rechts
-        sel_frame = tk.LabelFrame(self.root, text="Journals auswählen",
+        sel_frame = tk.LabelFrame(self.root,
+                                  text="Schritt 2 – Journals zuordnen",
                                   padx=10, pady=8)
         sel_frame.pack(fill=tk.X, padx=10, pady=(10, 4))
 
@@ -481,10 +498,137 @@ class CheckerApp:
         self.save_btn.pack(side=tk.LEFT, padx=5)
 
     # ------------------------------------------------------------------
-    # Datei-Picker & Auto-Suche
+    # Schritt 1 – USB wählen
     # ------------------------------------------------------------------
 
-    def _find_sync_journals(self) -> list[Path]:
+    def _pick_usb_root(self):
+        """User wählt die Wurzel des USB-Laufwerks. Alles weitere läuft automatisch."""
+        path = filedialog.askdirectory(
+            title="USB-Laufwerk (Wurzel) wählen...",
+            initialdir=str(Path.home())
+        )
+        if not path:
+            return
+
+        self._usb_root = Path(path)
+
+        # _sync-Unterordner suchen
+        sync = self._usb_root / "_sync"
+        if not sync.is_dir():
+            messagebox.showwarning(
+                "Kein _sync-Ordner",
+                f"Auf dem gewählten Laufwerk wurde kein _sync-Ordner gefunden:\n"
+                f"{self._usb_root}\n\n"
+                f"Bitte zuerst mit Script 1 (current_journal.py) ein Journal erstellen."
+            )
+            return
+
+        # Neuestes Datum-Unterverzeichnis automatisch wählen
+        dated = sorted([d for d in sync.iterdir() if d.is_dir()], reverse=True)
+        if not dated:
+            messagebox.showwarning(
+                "Kein Datum-Ordner",
+                f"Der _sync-Ordner enthält keine Unterordner:\n{sync}"
+            )
+            return
+
+        self._auto_save_dir = dated[0]
+        self.usb_display_var.set(
+            f"✔  {self._usb_root}  →  _sync/{dated[0].name}/"
+        )
+        # Label grün
+        for widget in self.root.pack_slaves():
+            pass  # display var update reicht
+
+        self.save_display_var.set(str(self._auto_save_dir))
+
+        # Journals automatisch laden
+        self._auto_find_journals()
+
+    # ------------------------------------------------------------------
+    # Schritt 2 – Journals suchen und zuordnen
+    # ------------------------------------------------------------------
+
+    def _auto_find_journals(self):
+        """
+        Sucht alle journal_*.json im gewählten _sync/DATUM/ Ordner.
+        Ordnet sie anhand von _MAC_, _WIN_, _USB_ im Dateinamen zu.
+        """
+        if not self._auto_save_dir or not self._auto_save_dir.is_dir():
+            return
+
+        journals = sorted(
+            self._auto_save_dir.glob("journal_*.json"),
+            reverse=True
+        )
+        self._available_journals = journals
+
+        # Listbox aktualisieren
+        self.journal_listbox.delete(0, tk.END)
+        for j in journals:
+            self.journal_listbox.insert(tk.END, j.name)
+
+        if not journals:
+            messagebox.showinfo(
+                "Keine Journals",
+                f"Keine journal_*.json gefunden in:\n{self._auto_save_dir}\n\n"
+                f"Bitte Script 1 auf den jeweiligen Rechnern ausführen."
+            )
+            return
+
+        # Auto-Zuordnung anhand _MAC_ / _WIN_ / _USB_ im Dateinamen
+        for slot in DEVICE_SLOTS:
+            keyword = f"_{slot.upper()}_"
+            for j in journals:
+                if keyword in j.name.upper():
+                    self.journal_vars[slot].set(str(j))
+                    break
+
+        self._update_slot_labels()
+
+    def _update_slot_labels(self):
+        for slot in DEVICE_SLOTS:
+            p = self.journal_vars[slot].get()
+            name = Path(p).name if p else "(nicht zugeordnet)"
+            self.slot_labels[slot].config(
+                text=name,
+                fg="#27ae60" if p else "#c0392b"
+            )
+        self._derive_save_dir()
+
+    def _derive_save_dir(self):
+        if self._auto_save_dir:
+            self.save_display_var.set(str(self._auto_save_dir))
+
+    def _on_listbox_select(self, event):
+        sel = self.journal_listbox.curselection()
+        if not sel:
+            return
+        j = self._available_journals[sel[0]]
+        slot = self.assign_slot_var.get()
+        self.journal_vars[slot].set(str(j))
+        self._update_slot_labels()
+
+    def _pick_journal(self, slot: str):
+        init = (str(self._auto_save_dir) if self._auto_save_dir
+                else str(Path.home()))
+        path = filedialog.askopenfilename(
+            title=f"Journal für {slot.upper()} wählen...",
+            initialdir=init,
+            filetypes=[("JSON", "*.json"), ("Alle Dateien", "*.*")]
+        )
+        if path:
+            self.journal_vars[slot].set(path)
+            self._update_slot_labels()
+
+    def _choose_save_dir(self):
+        d = filedialog.askdirectory(
+            title="Speicherort wählen...",
+            initialdir=str(self._auto_save_dir) if self._auto_save_dir else str(Path.home())
+        )
+        if d:
+            self._auto_save_dir = Path(d)
+            self.save_display_var.set(str(self._auto_save_dir))
         """
         Sucht alle journal_*.json Dateien im neuesten _sync-Unterordner
         auf angeschlossenen USB-Laufwerken. Gibt sortierte Liste zurück.
@@ -526,85 +670,6 @@ class CheckerApp:
             found = sorted(script_dir.glob("journal_*.json"), reverse=True)
 
         return found
-
-    def _auto_find_journals(self):
-        """
-        Sucht Journals und ordnet sie anhand von _MAC_, _WIN_, _USB_
-        im Dateinamen automatisch zu. Aktualisiert Dropdowns und Liste.
-        """
-        journals = self._find_sync_journals()
-        self._available_journals = journals
-
-        # Listbox befüllen
-        self.journal_listbox.delete(0, tk.END)
-        for j in journals:
-            self.journal_listbox.insert(tk.END, j.name)
-
-        # Auto-Zuordnung: ersten Treffer je Slot nehmen
-        for slot in DEVICE_SLOTS:
-            keyword = f"_{slot.upper()}_"
-            for j in journals:
-                if keyword in j.name.upper():
-                    self.journal_vars[slot].set(str(j))
-                    break
-
-        self._derive_save_dir()
-        self._update_slot_labels()
-
-    def _update_slot_labels(self):
-        """Zeigt den zugeordneten Dateinamen je Slot an."""
-        for slot in DEVICE_SLOTS:
-            p = self.journal_vars[slot].get()
-            name = Path(p).name if p else "(nicht zugeordnet)"
-            self.slot_labels[slot].config(
-                text=name,
-                fg="#27ae60" if p else "#c0392b"
-            )
-        self._derive_save_dir()
-
-    def _derive_save_dir(self):
-        """Leitet Speicherpfad aus USB-Journal oder erstem verfügbaren Journal ab."""
-        for slot in ["usb", "mac", "win"]:
-            p = self.journal_vars[slot].get().strip()
-            if p and Path(p).is_file():
-                self._auto_save_dir = Path(p).parent
-                suffix = "" if slot == "usb" else f"  (aus {slot.upper()}-Journal)"
-                self.save_display_var.set(str(self._auto_save_dir) + suffix)
-                return
-        self._auto_save_dir = None
-        self.save_display_var.set("(kein Journal gefunden)")
-
-    def _on_listbox_select(self, event):
-        """Listbox-Klick: ausgewähltes Journal dem aktiven Slot zuweisen."""
-        sel = self.journal_listbox.curselection()
-        if not sel:
-            return
-        j = self._available_journals[sel[0]]
-        slot = self.assign_slot_var.get()
-        self.journal_vars[slot].set(str(j))
-        self._update_slot_labels()
-
-    def _pick_journal(self, slot: str):
-        current = self.journal_vars[slot].get().strip()
-        init = str(Path(current).parent) if current and Path(current).exists() \
-               else (str(self._auto_save_dir) if self._auto_save_dir else str(Path.home()))
-        path = filedialog.askopenfilename(
-            title=f"Journal für {slot.upper()} wählen...",
-            initialdir=init,
-            filetypes=[("JSON", "*.json"), ("Alle Dateien", "*.*")]
-        )
-        if path:
-            self.journal_vars[slot].set(path)
-            self._update_slot_labels()
-
-    def _choose_save_dir(self):
-        d = filedialog.askdirectory(
-            title="Speicherort wählen...",
-            initialdir=str(self._auto_save_dir) if self._auto_save_dir else str(Path.home())
-        )
-        if d:
-            self._auto_save_dir = Path(d)
-            self.save_display_var.set(str(self._auto_save_dir))
 
     # ------------------------------------------------------------------
     # Vergleich
