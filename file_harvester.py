@@ -92,14 +92,16 @@ def sha256(path: Path, chunk: int = 1 << 20) -> str:
 
 
 def copy_verified(src: Path, dst: Path) -> tuple[bool, str]:
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst_lp = longpath(dst)
+    src_lp = longpath(src)
+    dst_lp.parent.mkdir(parents=True, exist_ok=True)
     try:
-        shutil.copy2(src, dst)
-        h_src = sha256(src)
-        h_dst = sha256(dst)
+        shutil.copy2(str(src_lp), str(dst_lp))
+        h_src = sha256(src_lp)
+        h_dst = sha256(dst_lp)
         if h_src != h_dst:
-            dst.unlink(missing_ok=True)
-            return False, f"Hash-Mismatch nach Kopieren"
+            dst_lp.unlink(missing_ok=True)
+            return False, "Hash-Mismatch nach Kopieren"
         return True, h_src
     except Exception as exc:
         return False, str(exc)
@@ -109,22 +111,31 @@ def copy_verified(src: Path, dst: Path) -> tuple[bool, str]:
 # ROOT-AUFLÖSUNG
 # ==============================================================================
 
+def longpath(p: Path) -> Path:
+    """
+    Windows: fuegt Praefix fuer Langpfade hinzu (> 260 Zeichen).
+    Auf Mac/Linux: keine Aenderung.
+    """
+    import platform
+    if platform.system() == "Windows" and not str(p).startswith("\\\\?\\"):
+        return Path("\\\\?\\" + str(p.resolve()))
+    return p
+
+
 def find_file_in_roots(roots: list[str], rel_path: str) -> Path | None:
     """
     Sucht rel_path in allen bekannten Roots eines Slots.
     Gibt den ersten Treffer zurück, None wenn nicht gefunden.
+    Unterstützt Windows-Langpfade (> 260 Zeichen).
     """
     for root in roots:
         r = Path(root)
         if not r.is_dir():
             continue
-        candidate = r / rel_path
-        if candidate.is_file():
-            return candidate
-        # Windows-Backslash-Fallback
-        candidate2 = r / rel_path.replace("/", "\\")
-        if candidate2.is_file():
-            return candidate2
+        for candidate in [r / rel_path, r / rel_path.replace("/", "\\")]:
+            lp = longpath(candidate)
+            if lp.is_file():
+                return lp
     return None
 
 
@@ -141,25 +152,27 @@ class Harvester:
 
     def __init__(
         self,
-        directive:      dict,
-        directive_path: Path,
-        harvest_root:   Path,
-        on_progress:    callable,
-        on_counter:     callable,
-        on_error:       callable,
-        on_log:         callable,
-        on_done:        callable,
-        cancel_event:   threading.Event,
+        directive:        dict,
+        directive_path:   Path,
+        harvest_root:     Path,
+        on_progress:      callable,
+        on_counter:       callable,
+        on_error:         callable,
+        on_log:           callable,
+        on_done:          callable,
+        cancel_event:     threading.Event,
+        usb_root_override: Path | None = None,   # gewählter USB-Pfad auf diesem System
     ):
-        self.directive      = directive
-        self.directive_path = directive_path
-        self.harvest_root   = harvest_root
-        self.on_progress    = on_progress
-        self.on_counter     = on_counter
-        self.on_error       = on_error
-        self.on_log         = on_log
-        self.on_done        = on_done
-        self.cancel_event   = cancel_event
+        self.directive         = directive
+        self.directive_path    = directive_path
+        self.harvest_root      = harvest_root
+        self.on_progress       = on_progress
+        self.on_counter        = on_counter
+        self.on_error          = on_error
+        self.on_log            = on_log
+        self.on_done           = on_done
+        self.cancel_event      = cancel_event
+        self.usb_root_override = usb_root_override
 
         self.today = datetime.now().strftime("%Y-%m-%d")
         self.report_entries: list[dict] = []
@@ -189,10 +202,22 @@ class Harvester:
 
     def run(self):
         sources = self.directive.get("sources", {})
+
+        # USB-Root aus Directive durch lokal gewählten Pfad ersetzen
+        # (nötig wenn Lauf 2 auf anderem OS: /Volumes/... → H:\)
+        if self.usb_root_override:
+            usb_sources = sources.get("usb", {})
+            old_roots = usb_sources.get("roots", [])
+            usb_sources["roots"] = [str(self.usb_root_override)]
+            self.on_log(
+                f"USB-Root-Override: {old_roots} → {self.usb_root_override}"
+            )
+            sources["usb"] = usb_sources
+
         entries = [e for e in self.directive.get("entries", [])
                    if e["action"] in HARVEST_ACTIONS]
 
-        # Vorhandenen Report laden (Lauf 2: bereits erledigte überspringen)
+        # Vorhandenen Report laden (Lauf 2+: bereits erledigte + pending_delete überspringen)
         done_keys = self._load_done_keys()
         pending = [e for e in entries if e["rel_path"] not in done_keys]
 
@@ -315,7 +340,11 @@ class Harvester:
         self.on_counter("pending", 1)
 
     def _load_done_keys(self) -> set[str]:
-        """Liest vorhandenen harvest_report und gibt bereits erledigte rel_paths zurück."""
+        """
+        Liest vorhandenen harvest_report.
+        Überspringt: ok + pending_delete (brauchen keinen weiteren Harvest).
+        Wiederholt:  pending + error (nochmal versuchen).
+        """
         report_path = self.harvest_root / "harvest_report.json"
         if not report_path.is_file():
             return set()
@@ -323,7 +352,7 @@ class Harvester:
             data = json.loads(report_path.read_text(encoding="utf-8"))
             return {
                 e["rel_path"] for e in data.get("entries", [])
-                if e.get("status") == "ok"
+                if e.get("status") in ("ok", "pending_delete")
             }
         except Exception:
             return set()
@@ -795,15 +824,16 @@ class HarvesterApp:
         self.status_var.set("⏳ Harvest läuft …")
 
         harvester = Harvester(
-            directive      = self._directive,
-            directive_path = self._directive_path,
-            harvest_root   = self._harvest_root,
-            on_progress    = self._cb_progress,
-            on_counter     = self._cb_counter,
-            on_error       = self._cb_error,
-            on_log         = self._cb_log,
-            on_done        = self._cb_done,
-            cancel_event   = self.cancel_event,
+            directive         = self._directive,
+            directive_path    = self._directive_path,
+            harvest_root      = self._harvest_root,
+            on_progress       = self._cb_progress,
+            on_counter        = self._cb_counter,
+            on_error          = self._cb_error,
+            on_log            = self._cb_log,
+            on_done           = self._cb_done,
+            cancel_event      = self.cancel_event,
+            usb_root_override = self._usb_root,   # H:\ oder /Volumes/... je nach System
         )
 
         threading.Thread(target=harvester.run, daemon=True).start()
