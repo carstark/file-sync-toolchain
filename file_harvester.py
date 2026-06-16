@@ -203,16 +203,32 @@ class Harvester:
     def run(self):
         sources = self.directive.get("sources", {})
 
-        # USB-Root aus Directive durch lokal gewählten Pfad ersetzen
-        # (nötig wenn Lauf 2 auf anderem OS: /Volumes/... → H:\)
+        # USB-Root aus Directive durch lokal gewählten Pfad ersetzen.
+        # Die Directive enthält oft mehrere Roots wie:
+        #   H:\Audiobooks - 20260125, H:\MichasDateien - 20260125, ...
+        # Der User wählt die Laufwerkswurzel H:\ — wir rekonstruieren
+        # die Unterordner-Roots indem wir den letzten Teil jeder alten Root
+        # unter dem neuen USB-Root suchen.
         if self.usb_root_override:
             usb_sources = sources.get("usb", {})
-            old_roots = usb_sources.get("roots", [])
-            usb_sources["roots"] = [str(self.usb_root_override)]
-            self.on_log(
-                f"USB-Root-Override: {old_roots} → {self.usb_root_override}"
-            )
+            old_roots   = usb_sources.get("roots", [])
+            new_roots   = []
+            for old in old_roots:
+                # Letzten Ordnernamen der alten Root nehmen
+                old_name = Path(old).name
+                candidate = self.usb_root_override / old_name
+                if candidate.is_dir():
+                    new_roots.append(str(candidate))
+                else:
+                    # Fallback: USB-Wurzel selbst
+                    new_roots.append(str(self.usb_root_override))
+            if not new_roots:
+                new_roots = [str(self.usb_root_override)]
+            usb_sources["roots"] = new_roots
             sources["usb"] = usb_sources
+            self.on_log(f"USB-Root-Override:")
+            for r in new_roots:
+                self.on_log(f"  {r}")
 
         entries = [e for e in self.directive.get("entries", [])
                    if e["action"] in HARVEST_ACTIONS]
@@ -360,7 +376,7 @@ class Harvester:
     def _save_report(self):
         ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
-        # Bestehenden Report laden und zusammenführen
+        # Bestehenden Report laden
         report_path = self.harvest_root / "harvest_report.json"
         existing = []
         if report_path.is_file():
@@ -371,12 +387,12 @@ class Harvester:
             except Exception:
                 pass
 
-        # Neue Einträge mergen (bestehende ok-Einträge bleiben)
-        existing_keys = {e["rel_path"] for e in existing if e.get("status") == "ok"}
-        merged = existing + [
-            e for e in self.report_entries
-            if e["rel_path"] not in existing_keys
-        ]
+        # Merge: neue Einträge gewinnen immer (überschreiben alte per rel_path)
+        existing_by_key = {e["rel_path"]: e for e in existing}
+        for e in self.report_entries:
+            existing_by_key[e["rel_path"]] = e   # neuer Eintrag überschreibt alten
+
+        merged = list(existing_by_key.values())
 
         ok_count      = sum(1 for e in merged if e.get("status") == "ok")
         pending_count = sum(1 for e in merged if e.get("status") == "pending")
