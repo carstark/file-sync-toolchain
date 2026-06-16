@@ -501,10 +501,10 @@ class ExecutionApp:
         exec_report_path = harvest_root / "execution_report.json"
         self._exec_report = ExecReport(exec_report_path)
 
-        # USB-Unterordner als Roots
-        usb_subs = [str(d) for d in self._usb_root.iterdir()
-                    if d.is_dir() and not d.name.startswith("_")]
-        self._usb_roots = usb_subs or [str(self._usb_root)]
+        # USB-Roots aus harvest_report Meta lesen (nicht USB-Unterordner scannen)
+        # Format im Report: entries[*].dst enthält den USB-Pfad
+        # Zuverlässigster Weg: dst-Pfade der ok-Einträge → gemeinsame Wurzel
+        self._usb_roots = self._derive_usb_roots(harvest_root)
 
         # Lauf-Status bestimmen
         if self._exec_report.run1_done:
@@ -806,44 +806,116 @@ class ExecutionApp:
         # Ziel-Roots abfragen wenn nötig
         self.root.after(0, self._ask_roots)
 
+    def _derive_usb_roots(self, harvest_root: Path) -> list[str]:
+        """
+        Leitet USB-Roots aus den dst-Pfaden im harvest_report ab.
+        Sucht den gemeinsamen Eltern-Ordner aller dst-Pfade auf dem USB.
+        Fallback: bekannte Unterordner-Namen direkt unter USB-Root prüfen.
+        """
+        entries = self._report.get("entries", [])
+        known_roots: set[str] = set()
+
+        for e in entries:
+            dst = e.get("dst", "")
+            if not dst:
+                continue
+            p = Path(dst)
+            # harvest_root liegt auf USB — alles was darunter liegt ignorieren.
+            # Wir suchen Roots die NEBEN dem _sync-Ordner liegen.
+            # Typisch: /Volumes/USB/MichasDateien - 20260125/...
+            # dst sieht so aus: /Volumes/USB/_sync/.../harvest/staging/mac/rel
+            # Daraus können wir die USB-Wurzel nicht ableiten.
+            # Stattdessen: Unterordner von usb_root die keine _-Ordner sind.
+            break
+
+        # Zuverlässigste Methode: Unterordner von usb_root prüfen
+        # aber NUR solche die Dateien enthalten (keine System-Ordner)
+        if self._usb_root:
+            candidates = []
+            try:
+                for d in self._usb_root.iterdir():
+                    if (d.is_dir()
+                            and not d.name.startswith(".")
+                            and not d.name.startswith("_")
+                            and d.name not in ("System Volume Information",
+                                               "Spotlight-V100",
+                                               "$RECYCLE.BIN",
+                                               "RECYCLER")):
+                        candidates.append(str(d))
+            except Exception:
+                pass
+            if candidates:
+                return candidates
+
+        return [str(self._usb_root)] if self._usb_root else []
+
     def _ask_roots(self):
-        """Fragt Roots ab (im Main-Thread wegen Dialog)."""
-        need_win = (
-            any(e["action"] == "COPY MAC" for e in self._copy_entries) or
-            any(self._decisions.get(f"CONFLICT del Mac::{top_folder(e['rel_path'])}")
-                == "confirm"
-                for e in self._del_entries
-                if e["action"] == "CONFLICT del Mac") or
-            any(self._decisions.get(f"CONFLICT del Win::{top_folder(e['rel_path'])}")
-                == "restore"
-                for e in self._del_entries
-                if e["action"] == "CONFLICT del Win")
-        )
-        need_mac = (
-            any(e["action"] == "COPY WIN" for e in self._copy_entries) or
-            any(self._decisions.get(f"CONFLICT del Win::{top_folder(e['rel_path'])}")
-                == "confirm"
-                for e in self._del_entries
-                if e["action"] == "CONFLICT del Win") or
-            any(self._decisions.get(f"CONFLICT del Mac::{top_folder(e['rel_path'])}")
-                == "restore"
-                for e in self._del_entries
-                if e["action"] == "CONFLICT del Mac")
-        )
+        """
+        Fragt Roots ab — mit klaren Dialogen welche Root gerade gefragt wird
+        und was passiert wenn man abbricht.
+        Im Hauptthread (wegen filedialog).
+        """
+        need_win = any(e["action"] == "COPY MAC"
+                       for e in self._copy_entries)
+        need_mac = any(e["action"] == "COPY WIN"
+                       for e in self._copy_entries)
 
+        # Auch für Löschungen / Wiederherstellungen prüfen
+        for e in self._del_entries:
+            act    = e["action"]
+            folder = top_folder(e["rel_path"])
+            key    = f"{act}::{folder}"
+            dec    = self._exec_report.decisions.get(
+                        key, self._decisions.get(key, "confirm"))
+            if act == "CONFLICT del Win" and dec == "confirm":
+                need_mac = True   # Mac muss löschen
+            if act == "CONFLICT del Mac" and dec == "confirm":
+                need_win = True   # Win muss löschen
+            if act == "CONFLICT del Win" and dec == "restore":
+                need_win = True   # Win bekommt Datei zurück
+            if act == "CONFLICT del Mac" and dec == "restore":
+                need_mac = True   # Mac bekommt Datei zurück
+
+        if self._conflict_entries:
+            need_mac = need_win = True
+
+        # Win-Root abfragen
         if need_win and not self._win_roots:
-            p = filedialog.askdirectory(
-                title="Win-Wurzelverzeichnis wählen "
-                      "(Netzwerkpfad oder lokaler Ordner) – "
-                      "Abbrechen = Win-Aktionen überspringen")
-            self._win_roots = [p] if p else []
+            ans = messagebox.askyesno(
+                "Win-Wurzelverzeichnis",
+                "Für diesen Lauf wird das Win-Wurzelverzeichnis benötigt.\n\n"
+                "Ist Win gerade erreichbar?\n"
+                "(Netzwerkfreigabe, lokaler Ordner, oder externer Mount)\n\n"
+                "Ja  → Ordner wählen\n"
+                "Nein → Win-Aktionen überspringen (werden beim nächsten Lauf nachgeholt)"
+            )
+            if ans:
+                p = filedialog.askdirectory(
+                    title="Win-Wurzelverzeichnis wählen "
+                          "(oberster Sync-Ordner auf Win)")
+                self._win_roots = [p] if p else []
+            else:
+                self._win_roots = []
+                self._log("Win-Root: übersprungen (nicht erreichbar)")
 
+        # Mac-Root abfragen
         if need_mac and not self._mac_roots:
-            p = filedialog.askdirectory(
-                title="Mac-Wurzelverzeichnis wählen "
-                      "(Netzwerkpfad oder Mountpunkt) – "
-                      "Abbrechen = Mac-Aktionen überspringen")
-            self._mac_roots = [p] if p else []
+            ans = messagebox.askyesno(
+                "Mac-Wurzelverzeichnis",
+                "Für diesen Lauf wird das Mac-Wurzelverzeichnis benötigt.\n\n"
+                "Ist Mac gerade erreichbar?\n"
+                "(Netzwerkfreigabe, lokaler Ordner, oder /Volumes/...)\n\n"
+                "Ja  → Ordner wählen\n"
+                "Nein → Mac-Aktionen überspringen (werden beim nächsten Lauf nachgeholt)"
+            )
+            if ans:
+                p = filedialog.askdirectory(
+                    title="Mac-Wurzelverzeichnis wählen "
+                          "(oberster Sync-Ordner auf Mac)")
+                self._mac_roots = [p] if p else []
+            else:
+                self._mac_roots = []
+                self._log("Mac-Root: übersprungen (nicht erreichbar)")
 
         threading.Thread(target=self._run_execution, daemon=True).start()
 
