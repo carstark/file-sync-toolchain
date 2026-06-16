@@ -246,20 +246,28 @@ class JournalApp:
 
         tk.Button(btn_frame, text="➕ Ordner hinzufügen",
                   command=self._add_folder, width=20).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="📂 Unterordner alle hinzufügen",
+                  command=self._add_subfolders, width=28).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="➖ Entfernen",
                   command=self._remove_folder, width=15).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="🗑️ Alle entfernen",
                   command=self._clear_folders, width=15).pack(side=tk.LEFT, padx=5)
 
-        # --- Speicherort ---
-        save_frame = tk.LabelFrame(self.root, text="Speicherort", padx=10, pady=5)
+        # --- Speicherort (USB) ---
+        save_frame = tk.LabelFrame(
+            self.root,
+            text="USB-Laufwerk  →  Journal wird in _sync/YYYY-MM-DD/ gespeichert",
+            padx=10, pady=5)
         save_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        self.save_dir_var = tk.StringVar(value=str(Path.home()))
-        tk.Entry(save_frame, textvariable=self.save_dir_var,
-                 font=("Courier", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        tk.Button(save_frame, text="📂", command=self._choose_save_dir,
-                  width=3).pack(side=tk.RIGHT, padx=5)
+        self.save_dir_var = tk.StringVar(value="")
+        self.save_display_var = tk.StringVar(value="(noch kein USB-Laufwerk gewählt)")
+        tk.Label(save_frame, textvariable=self.save_display_var,
+                 font=("Courier", 9), anchor="w",
+                 fg="#555").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(save_frame, text="📂 USB wählen",
+                  command=self._choose_save_dir,
+                  width=14).pack(side=tk.RIGHT, padx=5)
 
         # --- Fortschritt (nur Text) ---
         progress_frame = tk.LabelFrame(self.root, text="Fortschritt", padx=10, pady=5)
@@ -301,6 +309,27 @@ class JournalApp:
             self.selected_folders.append(folder)
             self.folder_listbox.insert(tk.END, folder)
 
+    def _add_subfolders(self):
+        """Wählt einen übergeordneten Ordner – alle direkten Unterordner werden hinzugefügt."""
+        parent = filedialog.askdirectory(
+            title="Übergeordneten Ordner wählen – alle Unterordner werden hinzugefügt"
+        )
+        if not parent:
+            return
+        added = 0
+        for sub in sorted(Path(parent).iterdir()):
+            if sub.is_dir() and not sub.name.startswith('.'):
+                s = str(sub)
+                if s not in self.selected_folders:
+                    self.selected_folders.append(s)
+                    self.folder_listbox.insert(tk.END, s)
+                    added += 1
+        if added == 0:
+            messagebox.showinfo(
+                "Keine Unterordner",
+                f"In '{Path(parent).name}' wurden keine Unterordner gefunden."
+            )
+
     def _remove_folder(self):
         selection = self.folder_listbox.curselection()
         if selection:
@@ -313,12 +342,19 @@ class JournalApp:
         self.folder_listbox.delete(0, tk.END)
 
     def _choose_save_dir(self):
-        directory = filedialog.askdirectory(
-            title="Zielordner für Journal auswählen...",
+        """Wählt das USB-Laufwerk. Legt _sync/YYYY-MM-DD/ automatisch an."""
+        usb = filedialog.askdirectory(
+            title="USB-Laufwerk (Wurzel) wählen...",
             initialdir=self.save_dir_var.get() or str(Path.home())
         )
-        if directory:
-            self.save_dir_var.set(directory)
+        if not usb:
+            return
+        sync_dir = Path(usb) / "_sync" / datetime.now().strftime("%Y-%m-%d")
+        sync_dir.mkdir(parents=True, exist_ok=True)
+        self.save_dir_var.set(str(sync_dir))
+        self.save_display_var.set(
+            f"{usb}  →  _sync/{datetime.now().strftime('%Y-%m-%d')}/"
+        )
 
     # --- Scan ---
 
@@ -327,6 +363,13 @@ class JournalApp:
             messagebox.showwarning(
                 "Keine Ordner",
                 "Bitte mindestens einen Ordner auswählen."
+            )
+            return
+
+        if not self.save_dir_var.get():
+            messagebox.showwarning(
+                "Kein USB-Laufwerk",
+                "Bitte zuerst ein USB-Laufwerk auswählen."
             )
             return
 
