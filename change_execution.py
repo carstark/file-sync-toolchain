@@ -2,27 +2,22 @@
 """
 change_execution.py  –  Script 4 des file-sync-toolchain
 ==========================================================
-Version 1.0
-
-Liest harvest_report.json und führt Änderungen kontrolliert aus.
+Version 1.1  –  Zwei-Lauf-fähig, Entscheidungen persistent
 
 Ablauf:
-  1. USB wählen → Report + Harvest-Ordner automatisch gefunden
-  2. Übersicht aller ausstehenden Aktionen
-  3. Abschnitt für Abschnitt entscheiden + ausführen:
+  Lauf 1  (z.B. auf Win + USB)
+    → Entscheidungen für alle Kategorien einholen
+    → Ausführen was erreichbar ist (Win + USB)
+    → execution_report.json auf USB speichern
+    → Meldet was noch aussteht (Mac-Seite)
 
-     COPY MAC/WIN/BOTH  → kein Dialog, Bestätigung als Zusammenfassung
-     del Win            → Vorauswahl: Löschen bestätigen
-                          Rückgängig: Datei von USB auf Win zurückspielen
-     del Mac            → Vorauswahl: Löschen bestätigen
-                          Rückgängig: Datei von USB auf Mac zurückspielen
-     DELETE             → beide haben gelöscht, Vorauswahl: von USB entfernen
-                          Sicherheitskopie bleibt in harvest/
-     CONFLICT modified  → Metadaten nebeneinander, User wählt Version
+  Lauf 2  (Mac + USB)
+    → Entscheidungen aus Lauf 1 laden (schreibgeschützt)
+    → Nur noch offene Einträge ausführen
+    → Complete melden
 
-Entscheidungen werden pro Ordner getroffen (nicht pro Datei).
-Ein Ordner-Urteil gilt für alle Unterordner und Dateien darin,
-außer der User klappt auf und entscheidet feiner.
+Entscheidungen sind nach Lauf 1 nicht mehr änderbar.
+Fehler beim Löschen: Dateien manuell aus harvest/_GELOESCHT/ holen.
 """
 
 import json
@@ -93,29 +88,6 @@ def top_folder(rel_path: str, depth: int = 2) -> str:
     return str(Path(*parts[:min(depth, len(parts))]))
 
 
-# ==============================================================================
-# REPORT LADEN & ROOTS AUFLÖSEN
-# ==============================================================================
-
-def resolve_roots(report: dict, usb_root: Path) -> dict[str, list[str]]:
-    """
-    Gibt Roots je Slot zurück, USB-Roots mit lokalem Override.
-    Format: {"mac": [...], "win": [...], "usb": [...]}
-    """
-    # Roots stehen in der Directive, nicht im Report.
-    # Wir nehmen sie aus dem Report-Meta falls vorhanden,
-    # sonst aus den dst-Pfaden der Einträge.
-    roots: dict[str, list[str]] = {"mac": [], "win": [], "usb": []}
-
-    # USB-Roots aus Unterordnern des gewählten USB-Laufwerks ableiten
-    if usb_root.is_dir():
-        usb_subs = [str(d) for d in usb_root.iterdir()
-                    if d.is_dir() and not d.name.startswith("_")]
-        roots["usb"] = usb_subs if usb_subs else [str(usb_root)]
-
-    return roots
-
-
 def find_in_roots(roots: list[str], rel_path: str) -> Path | None:
     for root in roots:
         r = Path(root)
@@ -128,6 +100,84 @@ def find_in_roots(roots: list[str], rel_path: str) -> Path | None:
     return None
 
 
+def roots_reachable(roots: list[str]) -> bool:
+    return any(Path(r).is_dir() for r in roots)
+
+
+# ==============================================================================
+# EXECUTION REPORT
+# ==============================================================================
+
+class ExecReport:
+    """Zustandsspeicher zwischen Läufen."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.decisions: dict[str, str] = {}   # folder_key → "confirm"|"restore"|"delete"|"keep"|"mac"|"win"
+        self.entries:   list[dict]     = []
+        self.run1_done: bool           = False
+        self._load()
+
+    def _load(self):
+        if not self.path.is_file():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            self.decisions  = data.get("decisions", {})
+            self.entries    = data.get("entries", [])
+            self.run1_done  = data.get("meta", {}).get("run1_done", False)
+        except Exception:
+            pass
+
+    def save(self, run1_done: bool = False):
+        done    = sum(1 for e in self.entries if e.get("status") == "ok")
+        pending = sum(1 for e in self.entries if e.get("status") == "pending")
+        errors  = sum(1 for e in self.entries if e.get("status") == "error")
+        complete = (pending == 0 and errors == 0 and len(self.entries) > 0)
+
+        data = {
+            "meta": {
+                "created":   datetime.now().isoformat(),
+                "tool":      "change_execution.py",
+                "version":   "1.1",
+                "run1_done": run1_done or self.run1_done,
+                "complete":  complete,
+            },
+            "summary": {
+                "done":     done,
+                "pending":  pending,
+                "error":    errors,
+                "complete": complete,
+            },
+            "decisions": self.decisions,
+            "entries":   self.entries,
+        }
+        self.path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
+        return complete
+
+    def done_keys(self) -> set[str]:
+        return {e["rel_path"] + "::" + e.get("sub", "")
+                for e in self.entries if e.get("status") == "ok"}
+
+    def upsert(self, rel_path: str, sub: str, status: str,
+               action: str, decision: str, **kwargs):
+        key = rel_path + "::" + sub
+        for e in self.entries:
+            if e.get("rel_path") == rel_path and e.get("sub") == sub:
+                e["status"]   = status
+                e["decision"] = decision
+                e.update(kwargs)
+                return
+        self.entries.append({
+            "rel_path": rel_path, "sub": sub,
+            "action": action, "decision": decision,
+            "status": status, **kwargs
+        })
+
+
 # ==============================================================================
 # HAUPT-APP
 # ==============================================================================
@@ -136,18 +186,35 @@ class ExecutionApp:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("⚡ Change Execution")
-        self.root.geometry("1020x780")
+        self.root.title("⚡ Change Execution v1.1")
+        self.root.geometry("1020x820")
         self.root.resizable(True, True)
 
-        self._report:       dict | None = None
-        self._harvest_root: Path | None = None
-        self._usb_root:     Path | None = None
-        self._exec_log:     list[str]   = []
-        self._log_path:     Path | None = None
+        self._report:      dict | None      = None
+        self._exec_report: ExecReport | None = None
+        self._harvest_root: Path | None     = None
+        self._usb_root:     Path | None     = None
+        self._exec_log:     list[str]       = []
 
-        # Entscheidungen je Ordner: {rel_folder: "confirm"|"restore"|"skip"}
-        self._decisions: dict[str, str] = {}
+        # Entscheidungen (Lauf 1: vom User, Lauf 2: aus Report geladen)
+        self._decisions:       dict[str, str] = {}  # del/restore
+        self._delete_keep:     dict[str, bool] = {} # DELETE-Einträge
+        self._conflict_winner: dict[str, str]  = {} # mac|win
+
+        # Einträge aus harvest_report
+        self._copy_entries:   list[dict] = []
+        self._del_entries:    list[dict] = []
+        self._delete_entries: list[dict] = []
+        self._conflict_entries: list[dict] = []
+
+        # Treeview-Mapping
+        self._del_item_map: dict[str, str] = {}  # iid → folder_key
+
+        # Root-Caches
+        self._win_roots: list[str] = []
+        self._mac_roots: list[str] = []
+
+        self._locked = False  # True nach Lauf 1 → Entscheidungen schreibgeschützt
 
         self._build_ui()
 
@@ -156,7 +223,6 @@ class ExecutionApp:
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        # Header
         hdr = tk.Frame(self.root, bg="#922b21", height=54)
         hdr.pack(fill=tk.X)
         hdr.pack_propagate(False)
@@ -164,7 +230,7 @@ class ExecutionApp:
                  font=("Helvetica", 14, "bold"),
                  bg="#922b21", fg="white").pack(pady=13)
 
-        # USB-Picker
+        # USB
         usb_frame = tk.LabelFrame(self.root,
                                   text="Schritt 1 – USB-Laufwerk wählen",
                                   padx=10, pady=6)
@@ -178,92 +244,71 @@ class ExecutionApp:
                   font=("Helvetica", 10, "bold"),
                   bg="#922b21", fg="white", width=24).pack(side=tk.RIGHT)
 
-        # Statuszeile
-        info_frame = tk.LabelFrame(self.root, text="Status",
-                                   padx=10, pady=4)
-        info_frame.pack(fill=tk.X, padx=10, pady=4)
+        # Status
+        info = tk.LabelFrame(self.root, text="Status", padx=10, pady=4)
+        info.pack(fill=tk.X, padx=10, pady=4)
         self.status_var = tk.StringVar(value="–")
-        tk.Label(info_frame, textvariable=self.status_var,
-                 font=("Courier", 9), anchor="w").pack(fill=tk.X)
+        self.lauf_var   = tk.StringVar(value="–")
+        for label, var in [("Status:", self.status_var),
+                            ("Lauf:",   self.lauf_var)]:
+            row = tk.Frame(info)
+            row.pack(fill=tk.X)
+            tk.Label(row, text=label, width=10, anchor="w",
+                     font=("Helvetica", 9, "bold")).pack(side=tk.LEFT)
+            tk.Label(row, textvariable=var,
+                     font=("Courier", 9), anchor="w").pack(side=tk.LEFT)
 
         # Notebook
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
 
-        # Tab 1: Übersicht
-        self.overview_frame = tk.Frame(self.nb)
+        self.overview_frame  = tk.Frame(self.nb)
+        self.copy_frame      = tk.Frame(self.nb)
+        self.del_frame       = tk.Frame(self.nb)
+        self.delete_frame    = tk.Frame(self.nb)
+        self.conflict_frame  = tk.Frame(self.nb)
+        self.log_frame       = tk.Frame(self.nb)
+
         self.nb.add(self.overview_frame, text="📊 Übersicht")
+        self.nb.add(self.copy_frame,     text="📋 COPY")
+        self.nb.add(self.del_frame,      text="🗑 Löschungen")
+        self.nb.add(self.delete_frame,   text="🗑 DELETE")
+        self.nb.add(self.conflict_frame, text="⚠️  CONFLICT")
+        self.nb.add(self.log_frame,      text="📋 Log")
+
         self._build_overview_tab()
-
-        # Tab 2: COPY (automatisch)
-        self.copy_frame = tk.Frame(self.nb)
-        self.nb.add(self.copy_frame, text="📋 COPY")
         self._build_copy_tab()
-
-        # Tab 3: Löschungen
-        self.del_frame = tk.Frame(self.nb)
-        self.nb.add(self.del_frame, text="🗑 Löschungen")
         self._build_del_tab()
-
-        # Tab 4: DELETE (beide gelöscht)
-        self.delete_frame = tk.Frame(self.nb)
-        self.nb.add(self.delete_frame, text="🗑 DELETE")
         self._build_delete_tab()
-
-        # Tab 5: CONFLICT
-        self.conflict_frame = tk.Frame(self.nb)
-        self.nb.add(self.conflict_frame, text="⚠️ CONFLICT")
         self._build_conflict_tab()
-
-        # Tab 6: Log
-        self.log_frame = tk.Frame(self.nb)
-        self.nb.add(self.log_frame, text="📋 Log")
-        self.log_text = tk.Text(self.log_frame, font=("Courier", 8),
-                                state=tk.DISABLED,
-                                bg="#1e1e1e", fg="#d4d4d4")
-        lsb = ttk.Scrollbar(self.log_frame, orient="vertical",
-                             command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=lsb.set)
-        lsb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        self._build_log_tab()
 
         # Buttons
         btn = tk.Frame(self.root)
         btn.pack(fill=tk.X, padx=10, pady=6)
 
-        self.exec_copy_btn = tk.Button(
-            btn, text="▶ COPY ausführen",
-            command=self._exec_copy,
-            font=("Helvetica", 11, "bold"),
-            bg="#1a5276", fg="white",
-            state=tk.DISABLED, height=2, width=20)
-        self.exec_copy_btn.pack(side=tk.LEFT, padx=4)
-
-        self.exec_del_btn = tk.Button(
-            btn, text="▶ Löschungen ausführen",
-            command=self._exec_deletions,
-            font=("Helvetica", 11, "bold"),
-            bg="#7d6608", fg="white",
-            state=tk.DISABLED, height=2, width=22)
-        self.exec_del_btn.pack(side=tk.LEFT, padx=4)
-
-        self.exec_delete_btn = tk.Button(
-            btn, text="▶ DELETE ausführen",
-            command=self._exec_delete,
-            font=("Helvetica", 11, "bold"),
+        self.exec_btn = tk.Button(
+            btn, text="▶  Ausführen (dieser Lauf)",
+            command=self._execute,
+            font=("Helvetica", 12, "bold"),
             bg="#922b21", fg="white",
-            state=tk.DISABLED, height=2, width=18)
-        self.exec_delete_btn.pack(side=tk.LEFT, padx=4)
+            state=tk.DISABLED, height=2, width=28)
+        self.exec_btn.pack(side=tk.LEFT, padx=5)
 
         self.log_btn = tk.Button(
-            btn, text="📋 Log öffnen",
-            command=self._open_log,
+            btn, text="📋 Log speichern",
+            command=self._save_log,
             font=("Helvetica", 11),
-            state=tk.DISABLED, height=2, width=14)
-        self.log_btn.pack(side=tk.LEFT, padx=4)
+            state=tk.DISABLED, height=2, width=16)
+        self.log_btn.pack(side=tk.LEFT, padx=5)
+
+        self.lock_label = tk.Label(
+            btn, text="",
+            font=("Helvetica", 10, "italic"), fg="#922b21")
+        self.lock_label.pack(side=tk.LEFT, padx=10)
 
     # ------------------------------------------------------------------
-    # Tab: Übersicht
+    # Tab-Aufbau
     # ------------------------------------------------------------------
 
     def _build_overview_tab(self):
@@ -276,135 +321,103 @@ class ExecutionApp:
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.overview_text.pack(fill=tk.BOTH, expand=True)
 
-    # ------------------------------------------------------------------
-    # Tab: COPY
-    # ------------------------------------------------------------------
-
     def _build_copy_tab(self):
         tk.Label(self.copy_frame,
-                 text="Diese Dateien werden automatisch verteilt.\n"
-                      "Keine Entscheidung nötig — Bestätigung genügt.",
-                 font=("Helvetica", 10), fg="#555",
-                 justify="left").pack(anchor="w", padx=10, pady=6)
-
-        cols = ("action", "count", "size", "destination")
+                 text="Automatisch – keine Entscheidung nötig.",
+                 font=("Helvetica", 10), fg="#555").pack(
+                     anchor="w", padx=10, pady=6)
+        cols = ("action", "count", "destination")
         self.copy_tree = ttk.Treeview(self.copy_frame, columns=cols,
-                                      show="headings", height=8)
+                                      show="headings", height=6)
         self.copy_tree.heading("action",      text="Aktion")
         self.copy_tree.heading("count",       text="Dateien")
-        self.copy_tree.heading("size",        text="Größe")
-        self.copy_tree.heading("destination", text="Ziel")
-        self.copy_tree.column("action",      width=130, anchor="w")
+        self.copy_tree.heading("destination", text="Ziel (nach Ausführung)")
+        self.copy_tree.column("action",      width=160, anchor="w")
         self.copy_tree.column("count",       width=80,  anchor="center")
-        self.copy_tree.column("size",        width=90,  anchor="center")
-        self.copy_tree.column("destination", width=650, anchor="w")
+        self.copy_tree.column("destination", width=700, anchor="w")
         csb = ttk.Scrollbar(self.copy_frame, orient="vertical",
                              command=self.copy_tree.yview)
         self.copy_tree.configure(yscrollcommand=csb.set)
         csb.pack(side=tk.RIGHT, fill=tk.Y)
         self.copy_tree.pack(fill=tk.BOTH, expand=True, padx=10)
 
-    # ------------------------------------------------------------------
-    # Tab: Löschungen (del Win + del Mac)
-    # ------------------------------------------------------------------
-
     def _build_del_tab(self):
         top = tk.Frame(self.del_frame)
         top.pack(fill=tk.X, padx=10, pady=6)
-
         tk.Label(top,
-                 text="Vorauswahl: Löschen bestätigen  "
-                      "(Sicherheitskopie bleibt in harvest/_GELOESCHT/)",
+                 text="Vorauswahl: ✔ Löschen  "
+                      "| Sicherheitskopie bleibt in harvest/_GELOESCHT/",
                  font=("Helvetica", 10), fg="#555").pack(side=tk.LEFT)
+        self.all_confirm_btn = tk.Button(
+            top, text="Alle: ✔ Löschen",
+            command=lambda: self._set_all("confirm"), width=16)
+        self.all_confirm_btn.pack(side=tk.RIGHT, padx=4)
+        self.all_restore_btn = tk.Button(
+            top, text="Alle: ↩ Wiederherstellen",
+            command=lambda: self._set_all("restore"), width=22)
+        self.all_restore_btn.pack(side=tk.RIGHT, padx=4)
 
-        # Gesamt-Buttons
-        tk.Button(top, text="Alle: ✔ Löschen",
-                  command=lambda: self._set_all_decisions("confirm"),
-                  width=16).pack(side=tk.RIGHT, padx=4)
-        tk.Button(top, text="Alle: ↩ Wiederherstellen",
-                  command=lambda: self._set_all_decisions("restore"),
-                  width=20).pack(side=tk.RIGHT, padx=4)
-
-        # Treeview: Ordnerbaum
         cols = ("decision", "files", "size", "folder")
         self.del_tree = ttk.Treeview(self.del_frame, columns=cols,
-                                     show="headings",
-                                     selectmode="browse")
+                                     show="headings", selectmode="browse")
         self.del_tree.heading("decision", text="Entscheidung")
         self.del_tree.heading("files",    text="Dateien")
         self.del_tree.heading("size",     text="Größe")
         self.del_tree.heading("folder",   text="Ordner")
-        self.del_tree.column("decision", width=160, anchor="center")
+        self.del_tree.column("decision", width=170, anchor="center")
         self.del_tree.column("files",    width=70,  anchor="center")
         self.del_tree.column("size",     width=90,  anchor="center")
-        self.del_tree.column("folder",   width=650, anchor="w")
-
+        self.del_tree.column("folder",   width=640, anchor="w")
         dsb = ttk.Scrollbar(self.del_frame, orient="vertical",
                              command=self.del_tree.yview)
         self.del_tree.configure(yscrollcommand=dsb.set)
         dsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.del_tree.pack(fill=tk.BOTH, expand=True, padx=10)
-
-        # Doppelklick zum Umschalten
         self.del_tree.bind("<Double-1>", self._toggle_decision)
-
-        tk.Label(self.del_frame,
-                 text="Doppelklick auf Zeile zum Umschalten  |  "
-                      "Grün = Löschen bestätigt  |  Blau = Wiederherstellen",
-                 font=("Helvetica", 8), fg="#888"
-                 ).pack(anchor="w", padx=10, pady=2)
-
         self.del_tree.tag_configure("confirm", background="#d5f5e3")
         self.del_tree.tag_configure("restore", background="#d6eaf8")
-        self.del_tree.tag_configure("header",  background="#f0f0f0",
+        self.del_tree.tag_configure("header",  background="#ecf0f1",
                                     font=("Helvetica", 9, "bold"))
-
-    # ------------------------------------------------------------------
-    # Tab: DELETE (beide gelöscht)
-    # ------------------------------------------------------------------
+        tk.Label(self.del_frame,
+                 text="Doppelklick: umschalten  |  "
+                      "🔒 Nach Lauf 1 nicht mehr änderbar",
+                 font=("Helvetica", 8), fg="#888").pack(
+                     anchor="w", padx=10, pady=2)
 
     def _build_delete_tab(self):
         tk.Label(self.delete_frame,
-                 text="Diese Dateien wurden auf BEIDEN Rechnern gelöscht.\n"
-                      "Vorauswahl: von USB entfernen  "
-                      "(Sicherheitskopie verbleibt in harvest/)",
+                 text="Beide Rechner haben gelöscht.  "
+                      "Vorauswahl: von USB entfernen.\n"
+                      "Sicherheitskopie verbleibt in harvest/.",
                  font=("Helvetica", 10), fg="#555",
                  justify="left").pack(anchor="w", padx=10, pady=6)
-
-        cols = ("keep", "rel_path")
+        cols = ("decision", "rel_path")
         self.delete_tree = ttk.Treeview(self.delete_frame, columns=cols,
                                         show="headings", height=10)
-        self.delete_tree.heading("keep",     text="Behalten?")
+        self.delete_tree.heading("decision", text="Entscheidung")
         self.delete_tree.heading("rel_path", text="Datei")
-        self.delete_tree.column("keep",     width=100, anchor="center")
-        self.delete_tree.column("rel_path", width=860, anchor="w")
+        self.delete_tree.column("decision", width=120, anchor="center")
+        self.delete_tree.column("rel_path", width=840, anchor="w")
         delsb = ttk.Scrollbar(self.delete_frame, orient="vertical",
                                command=self.delete_tree.yview)
         self.delete_tree.configure(yscrollcommand=delsb.set)
         delsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.delete_tree.pack(fill=tk.BOTH, expand=True, padx=10)
         self.delete_tree.bind("<Double-1>", self._toggle_keep)
-        self.delete_tree.tag_configure("delete",  background="#fadbd8")
-        self.delete_tree.tag_configure("keep",    background="#d6eaf8")
-
+        self.delete_tree.tag_configure("delete", background="#fadbd8")
+        self.delete_tree.tag_configure("keep",   background="#d6eaf8")
         tk.Label(self.delete_frame,
-                 text="Doppelklick zum Umschalten  |  "
-                      "Rot = von USB löschen  |  Blau = auf USB behalten",
-                 font=("Helvetica", 8), fg="#888"
-                 ).pack(anchor="w", padx=10, pady=2)
-
-    # ------------------------------------------------------------------
-    # Tab: CONFLICT
-    # ------------------------------------------------------------------
+                 text="Doppelklick: umschalten  |  "
+                      "🔒 Nach Lauf 1 nicht mehr änderbar",
+                 font=("Helvetica", 8), fg="#888").pack(
+                     anchor="w", padx=10, pady=2)
 
     def _build_conflict_tab(self):
         tk.Label(self.conflict_frame,
-                 text="Dateien die auf Mac UND Win verändert wurden.\n"
-                      "Wähle welche Version künftig für alle drei gilt.\n"
-                      "Nicht gewählte Versionen bleiben in harvest/conflicts/ als Sicherheitskopie.",
+                 text="Mac UND Win verändert. Wähle welche Version gewinnt.\n"
+                      "Verlierer-Version bleibt in harvest/conflicts/.",
                  font=("Helvetica", 10), fg="#555",
                  justify="left").pack(anchor="w", padx=10, pady=6)
-
         cols = ("winner", "rel_path", "mac_info", "win_info")
         self.conf_tree = ttk.Treeview(self.conflict_frame, columns=cols,
                                       show="headings", height=10)
@@ -413,26 +426,36 @@ class ExecutionApp:
         self.conf_tree.heading("mac_info", text="Mac  (Größe / mtime)")
         self.conf_tree.heading("win_info", text="Win  (Größe / mtime)")
         self.conf_tree.column("winner",   width=90,  anchor="center")
-        self.conf_tree.column("rel_path", width=420, anchor="w")
-        self.conf_tree.column("mac_info", width=220, anchor="center")
-        self.conf_tree.column("win_info", width=220, anchor="center")
+        self.conf_tree.column("rel_path", width=380, anchor="w")
+        self.conf_tree.column("mac_info", width=230, anchor="center")
+        self.conf_tree.column("win_info", width=230, anchor="center")
         cfsb = ttk.Scrollbar(self.conflict_frame, orient="vertical",
                               command=self.conf_tree.yview)
         self.conf_tree.configure(yscrollcommand=cfsb.set)
         cfsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.conf_tree.pack(fill=tk.BOTH, expand=True, padx=10)
-        self.conf_tree.bind("<Double-1>", self._toggle_conflict_winner)
-        self.conf_tree.tag_configure("mac", background="#fde8d8")
-        self.conf_tree.tag_configure("win", background="#d6eaf8")
-        self.conf_tree.tag_configure("open", background="#fef9e7")
-
+        self.conf_tree.bind("<Double-1>", self._toggle_winner)
+        self.conf_tree.tag_configure("mac",  background="#fde8d8")
+        self.conf_tree.tag_configure("win",  background="#d6eaf8")
+        self.conf_tree.tag_configure("none", background="#fef9e7")
         tk.Label(self.conflict_frame,
-                 text="Doppelklick: Mac → Win → Mac wechseln",
-                 font=("Helvetica", 8), fg="#888"
-                 ).pack(anchor="w", padx=10, pady=2)
+                 text="Doppelklick: Mac ↔ Win wechseln  |  "
+                      "🔒 Nach Lauf 1 nicht mehr änderbar",
+                 font=("Helvetica", 8), fg="#888").pack(
+                     anchor="w", padx=10, pady=2)
+
+    def _build_log_tab(self):
+        self.log_text = tk.Text(self.log_frame, font=("Courier", 8),
+                                state=tk.DISABLED,
+                                bg="#1e1e1e", fg="#d4d4d4")
+        lsb = ttk.Scrollbar(self.log_frame, orient="vertical",
+                             command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=lsb.set)
+        lsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
 
     # ------------------------------------------------------------------
-    # USB wählen → Report laden
+    # USB wählen
     # ------------------------------------------------------------------
 
     def _pick_usb(self):
@@ -449,20 +472,19 @@ class ExecutionApp:
                                    f"Kein _sync-Ordner auf:\n{self._usb_root}")
             return
 
-        dated = sorted([d for d in sync.iterdir() if d.is_dir()], reverse=True)
+        dated = sorted([d for d in sync.iterdir() if d.is_dir()],
+                       reverse=True)
         if not dated:
-            messagebox.showwarning("Kein Datum-Ordner",
-                                   f"_sync enthält keine Unterordner")
             return
 
-        sync_dir      = dated[0]
-        harvest_root  = sync_dir / "harvest"
-        report_path   = harvest_root / "harvest_report.json"
+        sync_dir     = dated[0]
+        harvest_root = sync_dir / "harvest"
+        report_path  = harvest_root / "harvest_report.json"
 
         if not report_path.is_file():
             messagebox.showwarning(
                 "Kein harvest_report",
-                f"Kein harvest_report.json gefunden:\n{harvest_root}\n\n"
+                f"harvest_report.json nicht gefunden:\n{harvest_root}\n\n"
                 f"Bitte zuerst Script 3 ausführen.")
             return
 
@@ -475,18 +497,40 @@ class ExecutionApp:
 
         self._harvest_root = harvest_root
 
+        # Execution-Report laden (Lauf 2: Entscheidungen wiederherstellen)
+        exec_report_path = harvest_root / "execution_report.json"
+        self._exec_report = ExecReport(exec_report_path)
+
+        # USB-Unterordner als Roots
+        usb_subs = [str(d) for d in self._usb_root.iterdir()
+                    if d.is_dir() and not d.name.startswith("_")]
+        self._usb_roots = usb_subs or [str(self._usb_root)]
+
+        # Lauf-Status bestimmen
+        if self._exec_report.run1_done:
+            self._locked = True
+            lauf_str = "🔒 Lauf 2 – Entscheidungen aus Lauf 1 geladen (schreibgeschützt)"
+        else:
+            self._locked = False
+            lauf_str = "Lauf 1 – Entscheidungen treffen + ausführen"
+
         self.usb_var.set(
             f"✔  {self._usb_root}  →  _sync/{sync_dir.name}/harvest/")
-
         s = self._report["summary"]
         self.status_var.set(
-            f"Report geladen  |  OK: {s['ok']:,}  |  "
-            f"DELETE ausstehend: {s['pending_delete']:,}  |  "
-            f"Complete: {s.get('complete', False)}")
+            f"harvest_report: OK={s['ok']:,}  "
+            f"DELETE-ausstehend={s['pending_delete']:,}  "
+            f"Complete={s.get('complete')}")
+        self.lauf_var.set(lauf_str)
+
+        if self._locked:
+            self.lock_label.config(
+                text="🔒 Entscheidungen aus Lauf 1 – nicht mehr änderbar")
 
         self._populate_all()
+        self.exec_btn.config(state=tk.NORMAL)
         self._log(f"USB: {self._usb_root}")
-        self._log(f"Report: {report_path.name}")
+        self._log(f"Lauf: {'2 (locked)' if self._locked else '1'}")
 
     # ------------------------------------------------------------------
     # Tabs befüllen
@@ -494,58 +538,64 @@ class ExecutionApp:
 
     def _populate_all(self):
         entries = self._report.get("entries", [])
-        self._populate_overview(entries)
-        self._populate_copy(entries)
-        self._populate_del(entries)
-        self._populate_delete(entries)
-        self._populate_conflict(entries)
+        self._copy_entries     = [e for e in entries
+                                   if e.get("action") in
+                                   ("COPY MAC","COPY WIN","COPY")
+                                   and e.get("status") == "ok"]
+        self._del_entries      = [e for e in entries
+                                   if e.get("action") in
+                                   ("CONFLICT del Win","CONFLICT del Mac")
+                                   and e.get("status") == "ok"]
+        self._delete_entries   = [e for e in entries
+                                   if e.get("status") == "pending_delete"]
+        self._conflict_entries = [e for e in entries
+                                   if e.get("action") in
+                                   ("CONFLICT modified","CONFLICT new")
+                                   and e.get("status") == "ok"]
 
-        self.exec_copy_btn.config(state=tk.NORMAL)
-        self.exec_del_btn.config(state=tk.NORMAL)
-        self.exec_delete_btn.config(state=tk.NORMAL)
+        self._populate_overview()
+        self._populate_copy()
+        self._populate_del()
+        self._populate_delete()
+        self._populate_conflict()
 
-    def _populate_overview(self, entries):
-        copy_mac = sum(1 for e in entries
-                       if e.get("action") == "COPY MAC" and e.get("status") == "ok")
-        copy_win = sum(1 for e in entries
-                       if e.get("action") == "COPY WIN" and e.get("status") == "ok")
-        del_win  = sum(1 for e in entries
-                       if e.get("action") == "CONFLICT del Win"
-                       and e.get("status") == "ok")
-        del_mac  = sum(1 for e in entries
-                       if e.get("action") == "CONFLICT del Mac"
-                       and e.get("status") == "ok")
-        deletes  = sum(1 for e in entries
-                       if e.get("status") == "pending_delete")
-        conflicts = sum(1 for e in entries
-                        if e.get("action") in ("CONFLICT modified", "CONFLICT new")
-                        and e.get("status") == "ok")
+    def _populate_overview(self):
+        er   = self._exec_report
+        done = sum(1 for e in er.entries if e.get("status") == "ok")
+        pend = sum(1 for e in er.entries if e.get("status") == "pending")
+        err  = sum(1 for e in er.entries if e.get("status") == "error")
 
         lines = [
-            "=" * 60,
+            "=" * 62,
             "  CHANGE EXECUTION – ÜBERSICHT",
             f"  Stand: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            "=" * 60, "",
-            "  Automatisch (keine Entscheidung nötig):",
-            f"    COPY MAC  →  auf Win + USB:  {copy_mac:>6,} Dateien",
-            f"    COPY WIN  →  auf Mac + USB:  {copy_win:>6,} Dateien",
+            f"  {'🔒 Lauf 2 – Entscheidungen schreibgeschützt' if self._locked else 'Lauf 1 – Entscheidungen treffen'}",
+            "=" * 62, "",
+            "  Automatisch:",
+            f"    COPY MAC  → Win + USB:    {sum(1 for e in self._copy_entries if e['action']=='COPY MAC'):>6,} Dateien",
+            f"    COPY WIN  → Mac + USB:    {sum(1 for e in self._copy_entries if e['action']=='COPY WIN'):>6,} Dateien",
             "",
-            "  Entscheidung erforderlich:",
-            f"    del Win  (Win hat gelöscht):  {del_win:>6,} Dateien",
-            f"    del Mac  (Mac hat gelöscht):  {del_mac:>6,} Dateien",
-            f"    DELETE   (beide gelöscht):    {deletes:>6,} Dateien",
-            f"    CONFLICT modified:            {conflicts:>6,} Dateien",
+            "  Entscheidung (Ordner-weise, Doppelklick):",
+            f"    del Win  (Win gelöscht):  {sum(1 for e in self._del_entries if e['action']=='CONFLICT del Win'):>6,} Dateien",
+            f"    del Mac  (Mac gelöscht):  {sum(1 for e in self._del_entries if e['action']=='CONFLICT del Mac'):>6,} Dateien",
+            f"    DELETE   (beide gelöscht):{len(self._delete_entries):>6,} Dateien",
+            f"    CONFLICT modified:        {len(self._conflict_entries):>6,} Dateien",
             "",
-            "  Vorauswahl Löschungen: Löschen bestätigen",
-            "  (Sicherheitskopien bleiben in harvest/_GELOESCHT/)",
-            "",
-            "─" * 60,
-            "  SCHRITTE:",
-            "  1. Tab 'COPY'        → Dateien verteilen (kein Dialog)",
-            "  2. Tab 'Löschungen'  → Ordner-weise bestätigen oder",
-            "                         wiederherstellen",
-            "  3. Tab 'DELETE'      → von USB entfernen bestätigen",
-            "  4. Tab 'CONFLICT'    → Version wählen",
+        ]
+        if er.run1_done:
+            lines += [
+                "─" * 62,
+                "  LAUF 1 ABGESCHLOSSEN:",
+                f"    Erledigt:   {done:,}",
+                f"    Ausstehend: {pend:,}",
+                f"    Fehler:     {err:,}",
+                "",
+            ]
+        lines += [
+            "─" * 62,
+            "  HINWEIS:",
+            "  Entscheidungen sind nach Lauf 1 nicht mehr änderbar.",
+            "  Fehler → Dateien manuell aus harvest/_GELOESCHT/ holen.",
             "",
         ]
         self.overview_text.config(state=tk.NORMAL)
@@ -553,420 +603,531 @@ class ExecutionApp:
         self.overview_text.insert(tk.END, "\n".join(lines))
         self.overview_text.config(state=tk.DISABLED)
 
-    def _populate_copy(self, entries):
+    def _populate_copy(self):
         self.copy_tree.delete(*self.copy_tree.get_children())
-        self._copy_entries = []
-
         groups = {
-            "COPY MAC": {"label": "COPY MAC → Win + USB",  "entries": []},
-            "COPY WIN": {"label": "COPY WIN → Mac + USB",  "entries": []},
-            "COPY":     {"label": "COPY beide → USB",      "entries": []},
+            "COPY MAC": ("COPY MAC → Win + USB",  "win"),
+            "COPY WIN": ("COPY WIN → Mac + USB",  "mac"),
+            "COPY":     ("COPY beide → USB",      "both"),
         }
-        for e in entries:
-            act = e.get("action")
-            if act in groups and e.get("status") == "ok":
-                groups[act]["entries"].append(e)
-                self._copy_entries.append(e)
-
-        for act, g in groups.items():
-            if not g["entries"]:
+        for act, (label, slot) in groups.items():
+            grp = [e for e in self._copy_entries if e.get("action") == act]
+            if not grp:
                 continue
-            # Größe aus dst-Pfaden schätzen
-            total_b = 0
-            for e in g["entries"]:
-                dst = Path(e.get("dst", ""))
-                try:
-                    if longpath(dst).is_file():
-                        total_b += longpath(dst).stat().st_size
-                except Exception:
-                    pass
-
-            slot = act.split()[-1].lower() if act != "COPY" else "both"
-            dst_root = self._harvest_root / "staging" / slot if self._harvest_root else Path("?")
-
+            dst_root = self._harvest_root / "staging" / slot
             self.copy_tree.insert("", tk.END, values=(
-                g["label"],
-                f"{len(g['entries']):,}",
-                fmt_size(total_b) if total_b else "–",
-                str(dst_root),
-            ))
+                label, f"{len(grp):,}", str(dst_root)))
 
-    def _populate_del(self, entries):
+    def _populate_del(self):
         self.del_tree.delete(*self.del_tree.get_children())
-        self._del_entries = []
-        self._del_item_map = {}   # iid → folder_key
+        self._del_item_map = {}
 
-        # del Win + del Mac getrennt
-        for category, action, label_color in [
-            ("Win hat gelöscht (del Win)",
-             "CONFLICT del Win", "header"),
-            ("Mac hat gelöscht (del Mac)",
-             "CONFLICT del Mac", "header"),
+        for category, action in [
+            ("── Win hat gelöscht (del Win) ──", "CONFLICT del Win"),
+            ("── Mac hat gelöscht (del Mac) ──", "CONFLICT del Mac"),
         ]:
-            cat_entries = [e for e in entries
-                           if e.get("action") == action
-                           and e.get("status") == "ok"]
-            if not cat_entries:
+            cat = [e for e in self._del_entries if e.get("action") == action]
+            if not cat:
                 continue
-
-            # Kategorie-Header
             self.del_tree.insert("", tk.END,
-                                  values=("", f"{len(cat_entries):,}",
-                                          "", f"── {category} ──"),
-                                  tags=("header",))
+                values=("", f"{len(cat):,}", "", category),
+                tags=("header",))
 
-            # Ordner gruppieren
             folder_map: dict[str, list] = defaultdict(list)
-            for e in cat_entries:
+            for e in cat:
                 folder_map[top_folder(e["rel_path"])].append(e)
-                self._del_entries.append(e)
 
             for folder, fentries in sorted(folder_map.items()):
-                # Vorauswahl: confirm (Löschen)
                 key = f"{action}::{folder}"
-                self._decisions[key] = "confirm"
+                # Lauf 2: Entscheidung aus Report laden
+                if self._locked and key in self._exec_report.decisions:
+                    dec = self._exec_report.decisions[key]
+                else:
+                    dec = self._decisions.get(key, "confirm")
+                self._decisions[key] = dec
+
                 total_b = 0
                 for e in fentries:
-                    dst = Path(e.get("dst", ""))
                     try:
-                        total_b += longpath(dst).stat().st_size
+                        dst = longpath(Path(e.get("dst", "")))
+                        if dst.is_file():
+                            total_b += dst.stat().st_size
                     except Exception:
                         pass
+
+                label = "✔ Löschen" if dec == "confirm" else "↩ Wiederherstellen"
                 iid = self.del_tree.insert(
                     "", tk.END,
-                    values=("✔ Löschen",
-                            f"{len(fentries):,}",
-                            fmt_size(total_b),
-                            folder),
-                    tags=("confirm",)
-                )
+                    values=(label, f"{len(fentries):,}",
+                            fmt_size(total_b), folder),
+                    tags=(dec,))
                 self._del_item_map[iid] = key
 
-    def _populate_delete(self, entries):
+        # Lauf 2: Baum sperren
+        if self._locked:
+            self.all_confirm_btn.config(state=tk.DISABLED)
+            self.all_restore_btn.config(state=tk.DISABLED)
+
+    def _populate_delete(self):
         self.delete_tree.delete(*self.delete_tree.get_children())
-        self._delete_entries = []
-        self._delete_keep: dict[str, bool] = {}   # rel_path → keep?
+        self._delete_keep = {}
+        for e in self._delete_entries:
+            rel = e["rel_path"]
+            # Lauf 2: aus Report laden
+            if self._locked:
+                keep = self._exec_report.decisions.get(f"DELETE::{rel}", "delete") == "keep"
+            else:
+                keep = False
+            self._delete_keep[rel] = keep
+            label = "💾 Behalten" if keep else "🗑 Löschen"
+            tag   = "keep" if keep else "delete"
+            self.delete_tree.insert("", tk.END,
+                values=(label, rel), tags=(tag,))
 
-        for e in entries:
-            if e.get("status") == "pending_delete":
-                self._delete_entries.append(e)
-                rel = e["rel_path"]
-                self._delete_keep[rel] = False   # Vorauswahl: löschen
-                iid = self.delete_tree.insert(
-                    "", tk.END,
-                    values=("🗑 Löschen", rel),
-                    tags=("delete",)
-                )
-
-    def _populate_conflict(self, entries):
+    def _populate_conflict(self):
         self.conf_tree.delete(*self.conf_tree.get_children())
-        self._conflict_entries = []
-        self._conflict_winner: dict[str, str] = {}   # rel_path → "mac"|"win"
-
-        for e in entries:
-            if (e.get("action") in ("CONFLICT modified", "CONFLICT new")
-                    and e.get("status") == "ok"):
-                rel = e["rel_path"]
-                self._conflict_entries.append(e)
-                self._conflict_winner[rel] = "mac"   # Vorauswahl Mac
-
-                # Metadaten aus per_source lesen
-                ps = e.get("per_source", {})
-                mac_m = ps.get("mac", {})
-                win_m = ps.get("win", {})
-
-                def fmt_meta(m):
-                    if not m:
-                        return "–"
-                    size = fmt_size(m.get("size", 0))
-                    mt = datetime.fromtimestamp(
-                        m.get("mtime", 0)).strftime("%Y-%m-%d %H:%M")
-                    return f"{size}  {mt}"
-
-                self.conf_tree.insert("", tk.END,
-                    values=("📱 Mac", rel,
-                            fmt_meta(mac_m), fmt_meta(win_m)),
-                    tags=("mac",)
-                )
-
+        self._conflict_winner = {}
         if not self._conflict_entries:
             self.conf_tree.insert("", tk.END,
-                values=("", "(keine CONFLICT modified Einträge im Report)", "", ""),
-                tags=("open",))
+                values=("", "(keine CONFLICT modified im Report)", "", ""),
+                tags=("none",))
+            return
+        for e in self._conflict_entries:
+            rel = e["rel_path"]
+            if self._locked:
+                winner = self._exec_report.decisions.get(
+                    f"CONFLICT::{rel}", "mac")
+            else:
+                winner = "mac"
+            self._conflict_winner[rel] = winner
+            ps  = e.get("per_source", {})
+            def fmt(m):
+                if not m: return "–"
+                return (f"{fmt_size(m.get('size',0))}  "
+                        f"{datetime.fromtimestamp(m.get('mtime',0)).strftime('%Y-%m-%d %H:%M')}")
+            label = "📱 Mac" if winner == "mac" else "🖥 Win"
+            tag   = "mac"   if winner == "mac" else "win"
+            self.conf_tree.insert("", tk.END,
+                values=(label, rel, fmt(ps.get("mac")), fmt(ps.get("win"))),
+                tags=(tag,))
 
     # ------------------------------------------------------------------
-    # Interaktion: Doppelklick
+    # Doppelklick-Interaktion (nur in Lauf 1)
     # ------------------------------------------------------------------
 
     def _toggle_decision(self, event):
+        if self._locked:
+            return
         iid = self.del_tree.identify_row(event.y)
         if not iid or iid not in self._del_item_map:
             return
-        key = self._del_item_map[iid]
+        key     = self._del_item_map[iid]
         current = self._decisions.get(key, "confirm")
-        new = "restore" if current == "confirm" else "confirm"
+        new     = "restore" if current == "confirm" else "confirm"
         self._decisions[key] = new
-        vals = list(self.del_tree.item(iid, "values"))
+        vals    = list(self.del_tree.item(iid, "values"))
         vals[0] = "✔ Löschen" if new == "confirm" else "↩ Wiederherstellen"
         self.del_tree.item(iid, values=vals, tags=(new,))
 
     def _toggle_keep(self, event):
-        iid = self.delete_tree.identify_row(event.y)
+        if self._locked:
+            return
+        iid  = self.delete_tree.identify_row(event.y)
         if not iid:
             return
-        vals = list(self.delete_tree.item(iid, "values"))
-        rel  = vals[1]
+        vals    = list(self.delete_tree.item(iid, "values"))
+        rel     = vals[1]
         current = self._delete_keep.get(rel, False)
-        self._delete_keep[rel] = not current
-        vals[0] = "💾 Behalten" if not current else "🗑 Löschen"
-        tag = "keep" if not current else "delete"
-        self.delete_tree.item(iid, values=vals, tags=(tag,))
+        new     = not current
+        self._delete_keep[rel] = new
+        vals[0] = "💾 Behalten" if new else "🗑 Löschen"
+        self.delete_tree.item(iid, values=vals,
+                              tags=("keep" if new else "delete",))
 
-    def _toggle_conflict_winner(self, event):
-        iid = self.conf_tree.identify_row(event.y)
+    def _toggle_winner(self, event):
+        if self._locked:
+            return
+        iid  = self.conf_tree.identify_row(event.y)
         if not iid:
             return
-        vals = list(self.conf_tree.item(iid, "values"))
-        rel  = vals[1]
+        vals    = list(self.conf_tree.item(iid, "values"))
+        rel     = vals[1]
         current = self._conflict_winner.get(rel, "mac")
-        new = "win" if current == "mac" else "mac"
+        new     = "win" if current == "mac" else "mac"
         self._conflict_winner[rel] = new
         vals[0] = "🖥 Win" if new == "win" else "📱 Mac"
-        self.conf_tree.item(iid, values=vals, tags=(new,))
+        self.conf_tree.item(iid, values=vals,
+                            tags=("win" if new == "win" else "mac",))
 
-    def _set_all_decisions(self, decision: str):
+    def _set_all(self, decision: str):
+        if self._locked:
+            return
         for iid, key in self._del_item_map.items():
             self._decisions[key] = decision
-            vals = list(self.del_tree.item(iid, "values"))
+            vals    = list(self.del_tree.item(iid, "values"))
             vals[0] = "✔ Löschen" if decision == "confirm" else "↩ Wiederherstellen"
             self.del_tree.item(iid, values=vals, tags=(decision,))
 
     # ------------------------------------------------------------------
-    # Ausführung: COPY
+    # Ausführung
     # ------------------------------------------------------------------
 
-    def _exec_copy(self):
+    def _execute(self):
         if not self._harvest_root:
             return
 
-        # Ziel-Roots aus USB ableiten
-        roots = resolve_roots(self._report, self._usb_root)
+        # Entscheidungen in Report sichern (Lauf 1)
+        if not self._locked:
+            er = self._exec_report
+            # del-Entscheidungen
+            for key, dec in self._decisions.items():
+                er.decisions[key] = dec
+            # DELETE-Entscheidungen
+            for rel, keep in self._delete_keep.items():
+                er.decisions[f"DELETE::{rel}"] = "keep" if keep else "delete"
+            # CONFLICT-Entscheidungen
+            for rel, winner in self._conflict_winner.items():
+                er.decisions[f"CONFLICT::{rel}"] = winner
 
-        # Ziele bestimmen: welche Rechner brauchen welche Dateien?
-        targets = {
-            "COPY MAC": self._get_win_roots() + roots["usb"],
-            "COPY WIN": self._get_mac_roots() + roots["usb"],
-            "COPY":     roots["usb"],
-        }
-
-        to_copy = [(e, targets.get(e["action"], []))
-                   for e in self._copy_entries
-                   if targets.get(e["action"])]
-
-        if not to_copy:
-            messagebox.showinfo("COPY", "Keine COPY-Einträge zu verteilen.")
-            return
-
-        count = sum(len(t) for _, t in to_copy)
         ok = messagebox.askyesno(
-            "COPY bestätigen",
-            f"{len(to_copy):,} Dateien werden auf Ziel-Rechner/USB verteilt.\n"
-            f"  Gesamt-Kopiervorgänge: {count:,}\n\n"
-            f"⚠ Ziel-Roots müssen erreichbar sein.\n\n"
-            f"Jetzt ausführen?"
+            "Ausführen bestätigen",
+            f"Lauf {'2' if self._locked else '1'} wird jetzt ausgeführt.\n\n"
+            f"Nicht erreichbare Roots werden übersprungen\n"
+            f"und beim nächsten Lauf (USB umstecken) nachgeholt.\n\n"
+            f"Jetzt starten?"
         )
         if not ok:
             return
 
-        threading.Thread(
-            target=self._run_copy, args=(to_copy,), daemon=True
-        ).start()
+        self.exec_btn.config(state=tk.DISABLED)
+        threading.Thread(target=self._run_all, daemon=True).start()
 
-    def _run_copy(self, to_copy):
-        done, errors = 0, 0
-        for entry, dst_roots in to_copy:
-            src = Path(entry.get("dst", ""))   # staged Datei auf USB
+    def _run_all(self):
+        # Ziel-Roots abfragen wenn nötig
+        self.root.after(0, self._ask_roots)
+
+    def _ask_roots(self):
+        """Fragt Roots ab (im Main-Thread wegen Dialog)."""
+        need_win = (
+            any(e["action"] == "COPY MAC" for e in self._copy_entries) or
+            any(self._decisions.get(f"CONFLICT del Mac::{top_folder(e['rel_path'])}")
+                == "confirm"
+                for e in self._del_entries
+                if e["action"] == "CONFLICT del Mac") or
+            any(self._decisions.get(f"CONFLICT del Win::{top_folder(e['rel_path'])}")
+                == "restore"
+                for e in self._del_entries
+                if e["action"] == "CONFLICT del Win")
+        )
+        need_mac = (
+            any(e["action"] == "COPY WIN" for e in self._copy_entries) or
+            any(self._decisions.get(f"CONFLICT del Win::{top_folder(e['rel_path'])}")
+                == "confirm"
+                for e in self._del_entries
+                if e["action"] == "CONFLICT del Win") or
+            any(self._decisions.get(f"CONFLICT del Mac::{top_folder(e['rel_path'])}")
+                == "restore"
+                for e in self._del_entries
+                if e["action"] == "CONFLICT del Mac")
+        )
+
+        if need_win and not self._win_roots:
+            p = filedialog.askdirectory(
+                title="Win-Wurzelverzeichnis wählen "
+                      "(Netzwerkpfad oder lokaler Ordner) – "
+                      "Abbrechen = Win-Aktionen überspringen")
+            self._win_roots = [p] if p else []
+
+        if need_mac and not self._mac_roots:
+            p = filedialog.askdirectory(
+                title="Mac-Wurzelverzeichnis wählen "
+                      "(Netzwerkpfad oder Mountpunkt) – "
+                      "Abbrechen = Mac-Aktionen überspringen")
+            self._mac_roots = [p] if p else []
+
+        threading.Thread(target=self._run_execution, daemon=True).start()
+
+    def _run_execution(self):
+        er = self._exec_report
+
+        # bereits erledigte überspringen
+        done_keys = er.done_keys()
+
+        total_ok = total_pend = total_err = 0
+
+        # 1. COPY
+        total_ok, total_pend, total_err = self._run_copy(
+            done_keys, total_ok, total_pend, total_err)
+
+        # 2. Löschungen
+        total_ok, total_pend, total_err = self._run_del(
+            done_keys, total_ok, total_pend, total_err)
+
+        # 3. DELETE
+        total_ok, total_pend, total_err = self._run_delete(
+            done_keys, total_ok, total_pend, total_err)
+
+        # 4. CONFLICT (wird nach Harvest/conflicts komplett)
+        #    Hier: Gewinner-Version auf alle drei kopieren
+        total_ok, total_pend, total_err = self._run_conflicts(
+            done_keys, total_ok, total_pend, total_err)
+
+        # Report speichern
+        complete = er.save(run1_done=True)
+
+        msg = (
+            f"Lauf abgeschlossen.\n\n"
+            f"  Erledigt:   {total_ok:,}\n"
+            f"  Ausstehend: {total_pend:,}\n"
+            f"  Fehler:     {total_err:,}\n"
+        )
+        if complete:
+            msg += "\n✅ EXECUTION COMPLETE – alle Läufe abgeschlossen."
+        else:
+            msg += (
+                "\n⏳ Bitte USB an den anderen Rechner anschließen\n"
+                "und Change Execution dort erneut starten."
+            )
+
+        self.root.after(0, lambda: [
+            self.exec_btn.config(state=tk.NORMAL),
+            self.log_btn.config(state=tk.NORMAL),
+            messagebox.showinfo("Lauf abgeschlossen", msg),
+            self._populate_overview(),
+        ])
+
+    # ---- COPY ----
+
+    def _run_copy(self, done_keys, ok, pend, err):
+        for entry in self._copy_entries:
             rel = entry["rel_path"]
-            if not longpath(src).is_file():
-                self._log(f"MISS {rel}")
-                errors += 1
+            act = entry["action"]
+            src = longpath(Path(entry.get("dst", "")))  # staged auf USB
+
+            if not src.is_file():
+                self._log(f"MISS staging  {rel[:65]}")
+                er = self._exec_report
+                er.upsert(rel, act, "error", act, "copy",
+                          error="staging-Datei nicht gefunden")
+                err += 1
                 continue
-            for dst_root in dst_roots:
-                dst = Path(dst_root) / rel
-                ok, info = copy_verified(src, dst)
-                if ok:
-                    done += 1
-                    self._log(f"OK   COPY → {dst_root}  {rel[:60]}")
+
+            # Ziele bestimmen
+            targets: list[tuple[str, list[str]]] = []
+            if act == "COPY MAC":
+                targets = [("Win", self._win_roots),
+                           ("USB", self._usb_roots)]
+            elif act == "COPY WIN":
+                targets = [("Mac", self._mac_roots),
+                           ("USB", self._usb_roots)]
+            elif act == "COPY":
+                targets = [("USB", self._usb_roots)]
+
+            all_ok = True
+            any_pend = False
+            for label, roots in targets:
+                key = f"{rel}::{act}::{label}"
+                if key in done_keys:
+                    continue
+                if not roots_reachable(roots):
+                    self._log(f"PEND [{label} nicht erreichbar]  {rel[:55]}")
+                    self._exec_report.upsert(rel, f"{act}::{label}",
+                        "pending", act, "copy")
+                    any_pend = True
+                    all_ok   = False
+                    continue
+                dst_root = roots[0]
+                dst      = Path(dst_root) / rel
+                c_ok, info = copy_verified(src, dst)
+                if c_ok:
+                    self._log(f"OK   COPY→{label}  {rel[:55]}")
+                    self._exec_report.upsert(rel, f"{act}::{label}",
+                        "ok", act, "copy")
+                    ok += 1
                 else:
-                    errors += 1
-                    self._log(f"ERR  {info}  {rel[:60]}")
+                    self._log(f"ERR  COPY→{label}  {info}  {rel[:50]}")
+                    self._exec_report.upsert(rel, f"{act}::{label}",
+                        "error", act, "copy", error=info)
+                    err  += 1
+                    all_ok = False
 
-        self.root.after(0, lambda: messagebox.showinfo(
-            "COPY abgeschlossen",
-            f"Fertig.\n  Kopiert: {done:,}\n  Fehler:  {errors:,}"
-        ))
+            if any_pend:
+                pend += 1
+        return ok, pend, err
 
-    def _get_win_roots(self) -> list[str]:
-        """Fragt Win-Root ab falls nicht bekannt."""
-        if hasattr(self, "_win_roots") and self._win_roots:
-            return self._win_roots
-        path = filedialog.askdirectory(
-            title="Win-Wurzelverzeichnis wählen (z.B. Netzwerkpfad oder lokaler Ordner)"
-        )
-        self._win_roots = [path] if path else []
-        return self._win_roots
+    # ---- Löschungen ----
 
-    def _get_mac_roots(self) -> list[str]:
-        if hasattr(self, "_mac_roots") and self._mac_roots:
-            return self._mac_roots
-        path = filedialog.askdirectory(
-            title="Mac-Wurzelverzeichnis wählen (z.B. Netzwerkpfad oder Mountpunkt)"
-        )
-        self._mac_roots = [path] if path else []
-        return self._mac_roots
-
-    # ------------------------------------------------------------------
-    # Ausführung: Löschungen (del Win / del Mac)
-    # ------------------------------------------------------------------
-
-    def _exec_deletions(self):
-        confirm_count = sum(
-            1 for k, v in self._decisions.items() if v == "confirm")
-        restore_count = sum(
-            1 for k, v in self._decisions.items() if v == "restore")
-
-        ok = messagebox.askyesno(
-            "Löschungen ausführen",
-            f"Zusammenfassung:\n"
-            f"  ✔ Löschen bestätigen:    {confirm_count:,} Ordner\n"
-            f"  ↩ Wiederherstellen:      {restore_count:,} Ordner\n\n"
-            f"Bestätigte Löschungen werden auf Mac + Win ausgeführt.\n"
-            f"Wiederherstellungen werden von USB zurückgespielt.\n\n"
-            f"⚠ Mac/Win müssen erreichbar sein.\n\n"
-            f"Jetzt ausführen?"
-        )
-        if not ok:
-            return
-
-        threading.Thread(
-            target=self._run_deletions, daemon=True
-        ).start()
-
-    def _run_deletions(self):
-        done_del = done_restore = errors = 0
-
-        # Ordner-Entscheidungen auf Einzel-Einträge anwenden
+    def _run_del(self, done_keys, ok, pend, err):
         for entry in self._del_entries:
             rel    = entry["rel_path"]
             act    = entry["action"]
             folder = top_folder(rel)
             key    = f"{act}::{folder}"
-            dec    = self._decisions.get(key, "confirm")
+            dec    = self._exec_report.decisions.get(
+                        key, self._decisions.get(key, "confirm"))
 
             if dec == "confirm":
-                # Löschen: auf Mac UND Win (je nach wer die Datei noch hat)
-                # Der gesicherte USB-Pfad bleibt unangetastet
+                # Löschen auf dem Rechner der NICHT gelöscht hat
                 targets = []
                 if act == "CONFLICT del Win":
-                    # Win hat gelöscht → Mac muss auch löschen
-                    targets = self._get_mac_roots()
+                    targets = [("Mac", self._mac_roots)]
                 elif act == "CONFLICT del Mac":
-                    # Mac hat gelöscht → Win muss auch löschen
-                    targets = self._get_win_roots()
+                    targets = [("Win", self._win_roots)]
 
-                for t_root in targets:
-                    target_file = Path(t_root) / rel
-                    ok, info = delete_file(target_file)
-                    if ok:
-                        done_del += 1
-                        self._log(f"DEL  {t_root}/{rel[:55]}")
+                for label, roots in targets:
+                    ekey = f"{rel}::del::{label}"
+                    if ekey in done_keys:
+                        continue
+                    if not roots_reachable(roots):
+                        self._log(f"PEND [{label}]  DEL  {rel[:55]}")
+                        self._exec_report.upsert(rel, f"del::{label}",
+                            "pending", act, dec)
+                        pend += 1
+                        continue
+                    target = Path(roots[0]) / rel
+                    d_ok, info = delete_file(target)
+                    if d_ok:
+                        self._log(f"OK   DEL→{label}  {rel[:58]}")
+                        self._exec_report.upsert(rel, f"del::{label}",
+                            "ok", act, dec)
+                        ok += 1
                     else:
-                        if "nicht gefunden" in info.lower() or "no such" in info.lower():
-                            done_del += 1   # schon weg → ok
+                        if not target.exists():
+                            # schon weg → ok
+                            self._exec_report.upsert(rel, f"del::{label}",
+                                "ok", act, dec)
+                            ok += 1
                         else:
-                            errors += 1
-                            self._log(f"ERR  {info}  {rel[:55]}")
+                            self._log(f"ERR  DEL  {info}  {rel[:55]}")
+                            self._exec_report.upsert(rel, f"del::{label}",
+                                "error", act, dec, error=info)
+                            err += 1
 
             elif dec == "restore":
-                # Wiederherstellen: von USB (dst im Report) auf Ziel-Rechner
-                src = Path(entry.get("dst", ""))
-                if not longpath(src).is_file():
-                    self._log(f"MISS restore-Quelle  {rel[:60]}")
-                    errors += 1
-                    continue
-
+                # Wiederherstellen von USB auf den Rechner der gelöscht hat
+                src = longpath(Path(entry.get("dst", "")))
+                targets = []
                 if act == "CONFLICT del Win":
-                    targets = self._get_win_roots()
+                    targets = [("Win", self._win_roots)]
                 elif act == "CONFLICT del Mac":
-                    targets = self._get_mac_roots()
-                else:
-                    targets = []
+                    targets = [("Mac", self._mac_roots)]
 
-                for t_root in targets:
-                    dst = Path(t_root) / rel
-                    ok, info = copy_verified(src, dst)
-                    if ok:
-                        done_restore += 1
-                        self._log(f"RST  {t_root}/{rel[:55]}")
+                for label, roots in targets:
+                    ekey = f"{rel}::restore::{label}"
+                    if ekey in done_keys:
+                        continue
+                    if not src.is_file():
+                        self._log(f"MISS restore-Quelle  {rel[:60]}")
+                        self._exec_report.upsert(rel, f"restore::{label}",
+                            "error", act, dec,
+                            error="Quelle nicht gefunden")
+                        err += 1
+                        continue
+                    if not roots_reachable(roots):
+                        self._log(f"PEND [{label}]  RST  {rel[:55]}")
+                        self._exec_report.upsert(rel, f"restore::{label}",
+                            "pending", act, dec)
+                        pend += 1
+                        continue
+                    dst    = Path(roots[0]) / rel
+                    c_ok, info = copy_verified(src, dst)
+                    if c_ok:
+                        self._log(f"OK   RST→{label}  {rel[:58]}")
+                        self._exec_report.upsert(rel, f"restore::{label}",
+                            "ok", act, dec)
+                        ok += 1
                     else:
-                        errors += 1
-                        self._log(f"ERR  {info}  {rel[:55]}")
+                        self._log(f"ERR  RST  {info}  {rel[:55]}")
+                        self._exec_report.upsert(rel, f"restore::{label}",
+                            "error", act, dec, error=info)
+                        err += 1
 
-        self.root.after(0, lambda: messagebox.showinfo(
-            "Löschungen abgeschlossen",
-            f"Fertig.\n"
-            f"  Gelöscht:         {done_del:,}\n"
-            f"  Wiederhergestellt: {done_restore:,}\n"
-            f"  Fehler:            {errors:,}"
-        ))
+        return ok, pend, err
 
-    # ------------------------------------------------------------------
-    # Ausführung: DELETE (beide gelöscht)
-    # ------------------------------------------------------------------
+    # ---- DELETE ----
 
-    def _exec_delete(self):
-        to_del  = [e for e in self._delete_entries
-                   if not self._delete_keep.get(e["rel_path"], False)]
-        to_keep = [e for e in self._delete_entries
-                   if self._delete_keep.get(e["rel_path"], False)]
-
-        ok = messagebox.askyesno(
-            "DELETE bestätigen",
-            f"Auf USB löschen:  {len(to_del):,} Dateien\n"
-            f"Behalten:         {len(to_keep):,} Dateien\n\n"
-            f"Gelöschte Dateien sind danach nur noch in harvest/ vorhanden.\n\n"
-            f"Jetzt ausführen?"
-        )
-        if not ok:
-            return
-
-        threading.Thread(
-            target=self._run_delete, args=(to_del,), daemon=True
-        ).start()
-
-    def _run_delete(self, entries):
-        done = errors = 0
-        usb_roots = resolve_roots(self._report, self._usb_root)["usb"]
-
-        for entry in entries:
-            rel = entry["rel_path"]
-            src = find_in_roots(usb_roots, rel)
-            if src is None:
-                self._log(f"MISS DELETE  {rel[:70]}")
-                errors += 1
+    def _run_delete(self, done_keys, ok, pend, err):
+        for entry in self._delete_entries:
+            rel  = entry["rel_path"]
+            keep = self._delete_keep.get(rel, False)
+            ekey = f"{rel}::DELETE"
+            if ekey in done_keys:
                 continue
-            ok, info = delete_file(src)
-            if ok:
-                done += 1
-                self._log(f"DEL  {rel[:70]}")
+            if keep:
+                self._log(f"KEEP DELETE  {rel[:65]}")
+                self._exec_report.upsert(rel, "DELETE", "ok",
+                                         "DELETE", "keep")
+                ok += 1
+                continue
+            # Von USB löschen
+            src = find_in_roots(self._usb_roots, rel)
+            if src is None:
+                self._log(f"MISS DELETE  {rel[:65]}")
+                self._exec_report.upsert(rel, "DELETE", "ok",
+                                         "DELETE", "delete",
+                                         note="bereits nicht vorhanden")
+                ok += 1
+                continue
+            d_ok, info = delete_file(src)
+            if d_ok:
+                self._log(f"OK   DELETE  {rel[:65]}")
+                self._exec_report.upsert(rel, "DELETE", "ok",
+                                         "DELETE", "delete")
+                ok += 1
             else:
-                errors += 1
-                self._log(f"ERR  {info}  {rel[:60]}")
+                self._log(f"ERR  DELETE  {info}  {rel[:55]}")
+                self._exec_report.upsert(rel, "DELETE", "error",
+                                         "DELETE", "delete", error=info)
+                err += 1
+        return ok, pend, err
 
-        self.root.after(0, lambda: messagebox.showinfo(
-            "DELETE abgeschlossen",
-            f"  Von USB gelöscht: {done:,}\n  Fehler: {errors:,}"
-        ))
+    # ---- CONFLICT ----
+
+    def _run_conflicts(self, done_keys, ok, pend, err):
+        for entry in self._conflict_entries:
+            rel    = entry["rel_path"]
+            winner = self._conflict_winner.get(rel, "mac")
+
+            # Gewinner-Version aus harvest/conflicts/<rel>/_mac oder _win
+            src_path = (self._harvest_root / "conflicts" / rel
+                        / f"_{winner}")
+            ekey = f"{rel}::CONFLICT"
+            if ekey in done_keys:
+                continue
+            if not longpath(src_path).is_file():
+                self._log(f"MISS conflict-Quelle [{winner}]  {rel[:55]}")
+                self._exec_report.upsert(rel, "CONFLICT", "error",
+                    "CONFLICT modified", winner,
+                    error=f"harvest/conflicts/{rel}/_{winner} nicht gefunden")
+                err += 1
+                continue
+
+            # Auf alle drei verteilen: USB + Mac + Win
+            targets = [("USB",  self._usb_roots),
+                       ("Mac",  self._mac_roots),
+                       ("Win",  self._win_roots)]
+            any_pend = False
+            for label, roots in targets:
+                if not roots_reachable(roots):
+                    self._log(f"PEND [{label}]  CONF  {rel[:55]}")
+                    any_pend = True
+                    continue
+                dst   = Path(roots[0]) / rel
+                c_ok, info = copy_verified(longpath(src_path), dst)
+                if c_ok:
+                    self._log(f"OK   CONF→{label}  {rel[:55]}")
+                    ok += 1
+                else:
+                    self._log(f"ERR  CONF→{label}  {info}  {rel[:50]}")
+                    err += 1
+
+            status = "pending" if any_pend else "ok"
+            if any_pend:
+                pend += 1
+            self._exec_report.upsert(rel, "CONFLICT", status,
+                "CONFLICT modified", winner)
+
+        return ok, pend, err
 
     # ------------------------------------------------------------------
     # Log
@@ -982,17 +1143,15 @@ class ExecutionApp:
             self.log_text.insert(tk.END, line)
             self.log_text.see(tk.END)
             self.log_text.config(state=tk.DISABLED)
-            self.log_btn.config(state=tk.NORMAL)
 
         self.root.after(0, _upd)
 
-    def _open_log(self):
+    def _save_log(self):
         if not self._harvest_root:
             return
         ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         lp = self._harvest_root / f"execution_log_{ts}.txt"
         lp.write_text("".join(self._exec_log), encoding="utf-8")
-        self._log_path = lp
         import subprocess, platform
         s = platform.system()
         if s == "Darwin":
