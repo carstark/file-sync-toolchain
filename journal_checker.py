@@ -258,6 +258,8 @@ def compare_journals(journals: dict[str, dict]) -> dict:
             "device":    j.get("device", "?"),
             "timestamp": j.get("timestamp", "?"),
             "files":     j.get("summary", {}).get("total_files", 0),
+            # Absolute Wurzelpfade – werden von Script 3 direkt genutzt
+            "roots":     list(j.get("folders", {}).keys()),
         }
         for slot, j in journals.items()
     }
@@ -266,7 +268,7 @@ def compare_journals(journals: dict[str, dict]) -> dict:
         "meta": {
             "created": datetime.now().isoformat(),
             "tool":    "journal_checker.py",
-            "version": "2.0",
+            "version": "2.1",
             "usb_as_ground_truth": has_usb,
         },
         "sources":  sources_meta,
@@ -296,11 +298,12 @@ class CheckerApp:
         self.root.geometry("900x700")
         self.root.resizable(True, True)
 
-        self.journal_vars = {slot: tk.StringVar() for slot in DEVICE_SLOTS}
-        self.save_dir_var = tk.StringVar(value=str(Path.home()))
-        self._directive   = None
+        self.journal_vars   = {slot: tk.StringVar() for slot in DEVICE_SLOTS}
+        self._directive     = None
+        self._auto_save_dir = None   # wird aus USB-Journal abgeleitet
 
         self._build_ui()
+        self._auto_find_journals()
 
     # ------------------------------------------------------------------
     # UI
@@ -341,16 +344,19 @@ class CheckerApp:
                       "Min. 2 Journals erforderlich.",
                  font=("Helvetica", 9), fg="#555").pack(anchor="w", pady=(4, 0))
 
-        # Speicherort
+        # Speicherort – wird automatisch aus USB-Journal abgeleitet
         save_frame = tk.LabelFrame(self.root,
-                                   text="Speicherort für change_directive",
+                                   text="Speicherort für change_directive  "
+                                        "(automatisch aus USB-Journal)",
                                    padx=10, pady=4)
         save_frame.pack(fill=tk.X, padx=10, pady=4)
-        tk.Entry(save_frame, textvariable=self.save_dir_var,
-                 font=("Courier", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        tk.Button(save_frame, text="📂",
+        self.save_display_var = tk.StringVar(value="(wird nach Journal-Auswahl gesetzt)")
+        tk.Label(save_frame, textvariable=self.save_display_var,
+                 font=("Courier", 9), anchor="w", fg="#555"
+                 ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(save_frame, text="✏ ändern",
                   command=self._choose_save_dir,
-                  width=3).pack(side=tk.RIGHT, padx=4)
+                  width=10).pack(side=tk.RIGHT, padx=4)
 
         # Notebook: Zusammenfassung + Einträge
         nb = ttk.Notebook(self.root)
@@ -412,24 +418,100 @@ class CheckerApp:
         self.save_btn.pack(side=tk.LEFT, padx=5)
 
     # ------------------------------------------------------------------
-    # Datei-Picker
+    # Datei-Picker & Auto-Suche
     # ------------------------------------------------------------------
 
+    def _auto_find_journals(self):
+        """
+        Sucht beim Start automatisch nach Journals im _sync-Ordner des USB.
+        Erkennt USB-Laufwerke anhand von _sync-Unterordnern.
+        Nimmt je Slot das neueste Journal.
+        """
+        candidates = []
+
+        # Typische Mount-Punkte je Plattform durchsuchen
+        import platform
+        system = platform.system()
+        if system == "Darwin":
+            search_roots = list(Path("/Volumes").iterdir()) if Path("/Volumes").exists() else []
+        elif system == "Windows":
+            import string
+            search_roots = [Path(f"{d}:\\") for d in string.ascii_uppercase
+                            if Path(f"{d}:\\").exists()]
+        else:
+            search_roots = list(Path("/media").rglob("*")) + list(Path("/mnt").rglob("*"))
+
+        for root in search_roots:
+            sync = root / "_sync"
+            if sync.is_dir():
+                # Neuestes Datum-Unterverzeichnis
+                dated = sorted(
+                    [d for d in sync.iterdir() if d.is_dir()],
+                    reverse=True
+                )
+                for d in dated:
+                    for jfile in sorted(d.glob("journal_*.json"), reverse=True):
+                        candidates.append(jfile)
+                break  # erstes USB mit _sync nehmen
+
+        # Auch neben dem Script selbst suchen (falls Directive schon da liegt)
+        script_dir = Path(__file__).parent
+        for jfile in sorted(script_dir.rglob("journal_*.json"), reverse=True):
+            if jfile not in candidates:
+                candidates.append(jfile)
+
+        # Journals den Slots zuordnen (anhand Dateiname: journal_<device>_<datum>.json)
+        assigned = set()
+        for slot in DEVICE_SLOTS:
+            for jfile in candidates:
+                name_lower = jfile.stem.lower()
+                if slot in name_lower and jfile not in assigned:
+                    self.journal_vars[slot].set(str(jfile))
+                    assigned.add(jfile)
+                    break
+
+        # Speicherort aus USB-Journal ableiten
+        self._derive_save_dir()
+
+    def _derive_save_dir(self):
+        """Leitet den Speicherpfad für die Directive aus dem USB-Journal ab."""
+        usb_path = self.journal_vars["usb"].get().strip()
+        if usb_path and Path(usb_path).is_file():
+            self._auto_save_dir = Path(usb_path).parent
+            self.save_display_var.set(str(self._auto_save_dir))
+        else:
+            # Fallback: aus irgendeinem gefundenen Journal
+            for slot in DEVICE_SLOTS:
+                p = self.journal_vars[slot].get().strip()
+                if p and Path(p).is_file():
+                    self._auto_save_dir = Path(p).parent
+                    self.save_display_var.set(
+                        str(self._auto_save_dir) + "  (kein USB-Journal gefunden)"
+                    )
+                    break
+
     def _pick_journal(self, slot: str):
+        # Startverzeichnis: bereits gesetztes Journal oder _sync auf USB
+        current = self.journal_vars[slot].get().strip()
+        init = str(Path(current).parent) if current else str(Path.home())
+
         path = filedialog.askopenfilename(
             title=f"Journal für {slot.upper()} wählen...",
+            initialdir=init,
             filetypes=[("JSON", "*.json"), ("Alle Dateien", "*.*")]
         )
         if path:
             self.journal_vars[slot].set(path)
+            self._derive_save_dir()
 
     def _choose_save_dir(self):
         d = filedialog.askdirectory(
             title="Speicherort wählen...",
-            initialdir=self.save_dir_var.get() or str(Path.home())
+            initialdir=str(self._auto_save_dir) if self._auto_save_dir else str(Path.home())
         )
         if d:
-            self.save_dir_var.set(d)
+            self._auto_save_dir = Path(d)
+            self.save_display_var.set(str(self._auto_save_dir))
 
     # ------------------------------------------------------------------
     # Vergleich
@@ -564,9 +646,18 @@ class CheckerApp:
     def _save_directive(self):
         if not self._directive:
             return
+
+        if not self._auto_save_dir:
+            messagebox.showwarning(
+                "Kein Speicherort",
+                "Kein Speicherort ermittelt.\n"
+                "Bitte mindestens ein Journal laden."
+            )
+            return
+
         ts       = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         filename = f"change_directive_{ts}.json"
-        out_path = Path(self.save_dir_var.get()) / filename
+        out_path = Path(self._auto_save_dir) / filename
         try:
             save_directive(self._directive, out_path)
         except Exception as exc:
