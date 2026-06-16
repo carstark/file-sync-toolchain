@@ -2,37 +2,19 @@
 """
 file_harvester.py  –  Script 3 des file-sync-toolchain
 ========================================================
-Version 2.0  –  Zwei-Lauf-fähig, Roots aus Directive
+Version 2.1  –  Gesamtübersicht, CONFLICT-Fix, Zähler-Gesamt
 
-Ablauf:
-  Lauf 1  (z.B. Mac + USB angeschlossen)
-    → liest change_directive.json vom USB (_sync/DATUM/)
-    → erkennt welche Roots gerade erreichbar sind
-    → erntet alle Einträge deren Quelle verfügbar ist
-    → speichert harvest_report.json auf USB
-    → meldet was noch fehlt und bittet USB umzustecken
-
-  Lauf 2  (z.B. Win + USB angeschlossen)
-    → findet harvest_report.json von Lauf 1
-    → verarbeitet nur noch offene (pending) Einträge
-    → meldet Harvest complete wenn alles erledigt
-
-Ausgabe auf USB (_sync/DATUM/harvest/):
-  staging/mac/        ← COPY MAC
-  staging/win/        ← COPY WIN
-  staging/both/       ← COPY identisch auf beiden
-  conflicts/<path>/
-      _mac / _win     ← CONFLICT modified, beide Versionen
-  _GELOESCHT/DATUM/
-      del_win/        ← von USB gesichert (Win hatte gelöscht)
-      del_mac/        ← von USB gesichert (Mac hatte gelöscht)
-
-  harvest_report.json   ← Zustandsspeicher zwischen Läufen
-  harvest_log_<ts>.txt  ← menschenlesbares Log
+Änderungen v2.1:
+  - Gesamtübersicht-Tab nach Harvest (Dateien + MB/GB pro Kategorie)
+  - CONFLICT modified: beide Versionen getrennt als pending_mac / pending_win
+    verfolgt → Lauf auf Mac holt Mac-Version, Lauf auf Win Win-Version
+  - Zähler-Kacheln zeigen Gesamt-Stand aus Report (nicht nur aktuellen Lauf)
+  - DELETE-Meldung klarer formuliert
+  - Merge-Bug behoben: neueste Einträge überschreiben immer alte
 """
 
 import json
-import sys
+import os
 import hashlib
 import shutil
 import threading
@@ -63,26 +45,30 @@ HARVEST_ACTIONS = {
     A_DELETE,
 }
 
-# Welcher Slot muss als Quelle erreichbar sein
-ACTION_SOURCES = {
-    A_COPY_MAC:     ["mac"],
-    A_COPY_WIN:     ["win"],
-    A_COPY:         ["mac", "win"],   # einer reicht
-    A_CONF_MOD:     ["mac", "win"],   # beide gebraucht
-    A_CONF_NEW:     ["mac", "win"],
-    A_CONF_DEL_MAC: ["usb"],
-    A_CONF_DEL_WIN: ["usb"],
-    A_DELETE:       [],               # nichts kopieren, Script 4 löscht
-}
+# Status-Werte im Report
+# CONFLICT modified wird pro Slot getrennt verfolgt:
+#   "ok_mac" / "ok_win"     → diese Seite erfolgreich eingesammelt
+#   "pending_mac"           → Mac-Version fehlt noch
+#   "pending_win"           → Win-Version fehlt noch
+#   "ok"                    → beide Seiten vorhanden (vollständig)
 
 
 # ==============================================================================
 # HASHING & KOPIEREN
 # ==============================================================================
 
+def longpath(p: Path) -> Path:
+    """Windows: Langpfad-Praefix fuer Pfade > 260 Zeichen."""
+    import platform
+    if platform.system() == "Windows" and not str(p).startswith("\\\\?\\"):
+        return Path("\\\\?\\" + str(p.resolve()))
+    return p
+
+
 def sha256(path: Path, chunk: int = 1 << 20) -> str:
     h = hashlib.sha256()
-    with path.open("rb") as f:
+    lp = longpath(path)
+    with open(str(lp), "rb") as f:
         while True:
             block = f.read(chunk)
             if not block:
@@ -92,8 +78,8 @@ def sha256(path: Path, chunk: int = 1 << 20) -> str:
 
 
 def copy_verified(src: Path, dst: Path) -> tuple[bool, str]:
-    dst_lp = longpath(dst)
     src_lp = longpath(src)
+    dst_lp = longpath(dst)
     dst_lp.parent.mkdir(parents=True, exist_ok=True)
     try:
         shutil.copy2(str(src_lp), str(dst_lp))
@@ -107,27 +93,35 @@ def copy_verified(src: Path, dst: Path) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def dir_stats(path: Path) -> tuple[int, int]:
+    """Gibt (Anzahl Dateien, Bytes) eines Verzeichnisses zurück."""
+    count = 0
+    total = 0
+    if not path.is_dir():
+        return 0, 0
+    for f in path.rglob("*"):
+        if f.is_file():
+            try:
+                total += f.stat().st_size
+                count += 1
+            except OSError:
+                pass
+    return count, total
+
+
+def fmt_size(b: int) -> str:
+    if b >= 1 << 30:
+        return f"{b / (1 << 30):.1f} GB"
+    if b >= 1 << 20:
+        return f"{b / (1 << 20):.1f} MB"
+    return f"{b / (1 << 10):.1f} KB"
+
+
 # ==============================================================================
 # ROOT-AUFLÖSUNG
 # ==============================================================================
 
-def longpath(p: Path) -> Path:
-    """
-    Windows: fuegt Praefix fuer Langpfade hinzu (> 260 Zeichen).
-    Auf Mac/Linux: keine Aenderung.
-    """
-    import platform
-    if platform.system() == "Windows" and not str(p).startswith("\\\\?\\"):
-        return Path("\\\\?\\" + str(p.resolve()))
-    return p
-
-
 def find_file_in_roots(roots: list[str], rel_path: str) -> Path | None:
-    """
-    Sucht rel_path in allen bekannten Roots eines Slots.
-    Gibt den ersten Treffer zurück, None wenn nicht gefunden.
-    Unterstützt Windows-Langpfade (> 260 Zeichen).
-    """
     for root in roots:
         r = Path(root)
         if not r.is_dir():
@@ -140,7 +134,6 @@ def find_file_in_roots(roots: list[str], rel_path: str) -> Path | None:
 
 
 def roots_reachable(roots: list[str]) -> bool:
-    """True wenn mindestens eine Root gerade gemountet/erreichbar ist."""
     return any(Path(r).is_dir() for r in roots)
 
 
@@ -152,16 +145,16 @@ class Harvester:
 
     def __init__(
         self,
-        directive:        dict,
-        directive_path:   Path,
-        harvest_root:     Path,
-        on_progress:      callable,
-        on_counter:       callable,
-        on_error:         callable,
-        on_log:           callable,
-        on_done:          callable,
-        cancel_event:     threading.Event,
-        usb_root_override: Path | None = None,   # gewählter USB-Pfad auf diesem System
+        directive:         dict,
+        directive_path:    Path,
+        harvest_root:      Path,
+        on_progress:       callable,
+        on_counter:        callable,
+        on_error:          callable,
+        on_log:            callable,
+        on_done:           callable,
+        cancel_event:      threading.Event,
+        usb_root_override: Path | None = None,
     ):
         self.directive         = directive
         self.directive_path    = directive_path
@@ -177,7 +170,6 @@ class Harvester:
         self.today = datetime.now().strftime("%Y-%m-%d")
         self.report_entries: list[dict] = []
 
-    # Pfad-Helfer
     def _staging(self, slot: str, rel: str) -> Path:
         return self.harvest_root / "staging" / slot / rel
 
@@ -190,11 +182,11 @@ class Harvester:
     def _do_copy(self, src: Path, dst: Path, rel: str, action: str) -> bool:
         ok, info = copy_verified(src, dst)
         status = "ok" if ok else "error"
-        self.on_log(f"{'OK  ' if ok else 'ERR '} {action:<24s} {rel}")
+        self.on_log(f"{'OK  ' if ok else 'ERR '} {action:<26s} {rel}")
         self.report_entries.append({
             "rel_path": rel, "action": action, "status": status,
             "src": str(src), "dst": str(dst),
-            "sha256" if ok else "error": info,
+            **({"sha256": info} if ok else {"error": info}),
         })
         if not ok:
             self.on_error(rel, info)
@@ -203,43 +195,31 @@ class Harvester:
     def run(self):
         sources = self.directive.get("sources", {})
 
-        # USB-Root aus Directive durch lokal gewählten Pfad ersetzen.
-        # Die Directive enthält oft mehrere Roots wie:
-        #   H:\Audiobooks - 20260125, H:\MichasDateien - 20260125, ...
-        # Der User wählt die Laufwerkswurzel H:\ — wir rekonstruieren
-        # die Unterordner-Roots indem wir den letzten Teil jeder alten Root
-        # unter dem neuen USB-Root suchen.
+        # USB-Root-Override: lokalen Pfad als Ersatz für Directive-Roots
         if self.usb_root_override:
-            usb_sources = sources.get("usb", {})
-            old_roots   = usb_sources.get("roots", [])
-            new_roots   = []
+            usb_src = sources.get("usb", {})
+            old_roots = usb_src.get("roots", [])
+            new_roots = []
             for old in old_roots:
-                # Letzten Ordnernamen der alten Root nehmen
-                old_name = Path(old).name
-                candidate = self.usb_root_override / old_name
-                if candidate.is_dir():
-                    new_roots.append(str(candidate))
-                else:
-                    # Fallback: USB-Wurzel selbst
-                    new_roots.append(str(self.usb_root_override))
-            if not new_roots:
-                new_roots = [str(self.usb_root_override)]
-            usb_sources["roots"] = new_roots
-            sources["usb"] = usb_sources
-            self.on_log(f"USB-Root-Override:")
-            for r in new_roots:
+                candidate = self.usb_root_override / Path(old).name
+                new_roots.append(str(candidate if candidate.is_dir()
+                                     else self.usb_root_override))
+            usb_src["roots"] = new_roots or [str(self.usb_root_override)]
+            sources["usb"] = usb_src
+            self.on_log("USB-Root-Override:")
+            for r in usb_src["roots"]:
                 self.on_log(f"  {r}")
 
         entries = [e for e in self.directive.get("entries", [])
                    if e["action"] in HARVEST_ACTIONS]
 
-        # Vorhandenen Report laden (Lauf 2+: bereits erledigte + pending_delete überspringen)
         done_keys = self._load_done_keys()
-        pending = [e for e in entries if e["rel_path"] not in done_keys]
+        pending   = [e for e in entries if e["rel_path"] not in done_keys]
 
         total = len(pending)
         self.on_log(f"Harvest gestartet – {total} ausstehende Einträge")
-        self.on_log(f"  (von {len(entries)} gesamt, {len(done_keys)} bereits erledigt)")
+        self.on_log(f"  (von {len(entries)} gesamt, "
+                    f"{len(done_keys)} bereits erledigt)")
         self.on_log(f"Harvest-Verzeichnis: {self.harvest_root}")
 
         for i, entry in enumerate(pending):
@@ -247,68 +227,101 @@ class Harvester:
                 self.on_log("⏹ Abgebrochen.")
                 break
 
-            rel    = entry["rel_path"]
-            act    = entry["action"]
-            pres   = entry.get("presence", {})
+            rel  = entry["rel_path"]
+            act  = entry["action"]
+            pres = entry.get("presence", {})
 
             self.on_progress(i + 1, total, rel, act)
 
-            needed_slots = ACTION_SOURCES.get(act, [])
-
-            # Prüfen ob benötigte Quellen erreichbar sind
+            # ----------------------------------------------------------
+            # CONFLICT modified / new – je Slot einzeln verfolgen
+            # ----------------------------------------------------------
             if act in (A_CONF_MOD, A_CONF_NEW):
-                # Beide Versionen sammeln – was erreichbar ist, wird kopiert
-                copied_any = False
-                for slot in ("mac", "win"):
+                mac_done = entry.get("status") in ("ok_mac", "ok")
+                win_done = entry.get("status") in ("ok_win", "ok")
+
+                result = {"rel_path": rel, "action": act,
+                          "presence": pres, "slots": {}}
+
+                for slot, already_done in (("mac", mac_done),
+                                           ("win", win_done)):
                     if not pres.get(slot):
+                        continue
+                    if already_done:
                         continue
                     roots = sources.get(slot, {}).get("roots", [])
                     if not roots_reachable(roots):
-                        self.on_log(f"SKIP [{slot} nicht erreichbar]  {rel}")
+                        result["slots"][slot] = "pending"
                         continue
                     src = find_file_in_roots(roots, rel)
                     if src is None:
                         self.on_error(rel, f"{act}: {slot}-Version nicht gefunden")
-                        self.on_counter("not_found", 1)
+                        result["slots"][slot] = "error"
                         continue
                     dst = self._conflict(rel, slot)
-                    if self._do_copy(src, dst, rel, f"{act} [{slot}]"):
-                        copied_any = True
-                if copied_any:
+                    ok, info = copy_verified(src, dst)
+                    if ok:
+                        result["slots"][slot] = "ok"
+                        self.on_log(f"OK   {act} [{slot}]  {rel}")
+                    else:
+                        self.on_error(rel, info)
+                        result["slots"][slot] = "error"
+
+                # Gesamt-Status bestimmen
+                mac_st = result["slots"].get("mac",
+                         "ok" if not pres.get("mac") else "n/a")
+                win_st = result["slots"].get("win",
+                         "ok" if not pres.get("win") else "n/a")
+
+                if "pending" in (mac_st, win_st):
+                    result["status"] = ("ok_mac" if mac_st == "ok"
+                                        else "ok_win" if win_st == "ok"
+                                        else "pending")
+                elif "error" in (mac_st, win_st):
+                    result["status"] = "error"
+                else:
+                    result["status"] = "ok"
+
+                self.report_entries.append(result)
+                if result["status"] == "ok":
                     self.on_counter("conflict_mod", 1)
+                elif result["status"] in ("ok_mac", "ok_win"):
+                    self.on_counter("conflict_partial", 1)
                 continue
 
+            # ----------------------------------------------------------
+            # DELETE – Script 4 entscheidet
+            # ----------------------------------------------------------
             if act == A_DELETE:
                 self.on_log(f"SKIP DELETE  {rel}  → Script 4 entscheidet")
                 self.report_entries.append({
                     "rel_path": rel, "action": act,
                     "status": "pending_delete",
-                    "note": "Wird von change_execution.py nach Bestätigung gelöscht",
+                    "usb_roots": sources.get("usb", {}).get("roots", []),
                 })
                 self.on_counter("delete_pending", 1)
                 continue
 
-            # Quelle bestimmen
+            # ----------------------------------------------------------
+            # Alle anderen Aktionen
+            # ----------------------------------------------------------
             src = None
 
             if act == A_COPY_MAC:
                 roots = sources.get("mac", {}).get("roots", [])
                 if not roots_reachable(roots):
-                    self._skip_not_reachable(rel, act, "mac")
-                    continue
+                    self._skip(rel, act, "mac"); continue
                 src = find_file_in_roots(roots, rel)
                 dst = self._staging("mac", rel)
 
             elif act == A_COPY_WIN:
                 roots = sources.get("win", {}).get("roots", [])
                 if not roots_reachable(roots):
-                    self._skip_not_reachable(rel, act, "win")
-                    continue
+                    self._skip(rel, act, "win"); continue
                 src = find_file_in_roots(roots, rel)
                 dst = self._staging("win", rel)
 
             elif act == A_COPY:
-                # Einer reicht – Mac bevorzugt
                 for slot in ("mac", "win"):
                     roots = sources.get(slot, {}).get("roots", [])
                     if roots_reachable(roots):
@@ -317,14 +330,12 @@ class Harvester:
                             break
                 dst = self._staging("both", rel)
                 if src is None:
-                    self._skip_not_reachable(rel, act, "mac+win")
-                    continue
+                    self._skip(rel, act, "mac+win"); continue
 
             elif act in (A_CONF_DEL_WIN, A_CONF_DEL_MAC):
                 roots = sources.get("usb", {}).get("roots", [])
                 if not roots_reachable(roots):
-                    self._skip_not_reachable(rel, act, "usb")
-                    continue
+                    self._skip(rel, act, "usb"); continue
                 src = find_file_in_roots(roots, rel)
                 sub = "del_win" if act == A_CONF_DEL_WIN else "del_mac"
                 dst = self._deleted(sub, rel)
@@ -335,49 +346,47 @@ class Harvester:
                 continue
 
             if self._do_copy(src, dst, rel, act):
-                counter = {
-                    A_COPY_MAC:     "copy_mac",
-                    A_COPY_WIN:     "copy_win",
-                    A_COPY:         "copy_both",
-                    A_CONF_DEL_WIN: "conflict_del",
-                    A_CONF_DEL_MAC: "conflict_del",
-                }.get(act, "ok")
-                self.on_counter(counter, 1)
+                key = {A_COPY_MAC: "copy_mac", A_COPY_WIN: "copy_win",
+                       A_COPY: "copy_both", A_CONF_DEL_WIN: "conflict_del",
+                       A_CONF_DEL_MAC: "conflict_del"}.get(act, "ok")
+                self.on_counter(key, 1)
 
         self._save_report()
 
-    def _skip_not_reachable(self, rel: str, act: str, slot: str):
-        self.on_log(f"PEND [{slot} nicht angeschlossen]  {rel}")
+    def _skip(self, rel: str, act: str, slot: str):
+        self.on_log(f"PEND [{slot} nicht erreichbar]  {rel}")
         self.report_entries.append({
             "rel_path": rel, "action": act,
-            "status": "pending",
-            "reason": f"{slot} nicht erreichbar",
+            "status": "pending", "reason": f"{slot} nicht erreichbar",
         })
         self.on_counter("pending", 1)
 
     def _load_done_keys(self) -> set[str]:
         """
-        Liest vorhandenen harvest_report.
-        Überspringt: ok + pending_delete (brauchen keinen weiteren Harvest).
-        Wiederholt:  pending + error (nochmal versuchen).
+        Überspringt: ok, ok_mac, ok_win, pending_delete.
+        Wiederholt:  pending, error (nochmal versuchen).
+        CONFLICT partial (ok_mac/ok_win) bekommt Slot-Status mit.
         """
         report_path = self.harvest_root / "harvest_report.json"
         if not report_path.is_file():
             return set()
         try:
             data = json.loads(report_path.read_text(encoding="utf-8"))
-            return {
-                e["rel_path"] for e in data.get("entries", [])
-                if e.get("status") in ("ok", "pending_delete")
-            }
+            skip = set()
+            for e in data.get("entries", []):
+                st = e.get("status", "")
+                if st in ("ok", "pending_delete"):
+                    skip.add(e["rel_path"])
+                # ok_mac / ok_win: noch pending für andere Seite
+                # → NICHT überspringen, Harvester versucht fehlende Seite
+            return skip
         except Exception:
             return set()
 
     def _save_report(self):
         ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-
-        # Bestehenden Report laden
         report_path = self.harvest_root / "harvest_report.json"
+
         existing = []
         if report_path.is_file():
             try:
@@ -387,35 +396,36 @@ class Harvester:
             except Exception:
                 pass
 
-        # Merge: neue Einträge gewinnen immer (überschreiben alte per rel_path)
-        existing_by_key = {e["rel_path"]: e for e in existing}
+        # Merge: neue Einträge überschreiben alte per rel_path
+        merged_map = {e["rel_path"]: e for e in existing}
         for e in self.report_entries:
-            existing_by_key[e["rel_path"]] = e   # neuer Eintrag überschreibt alten
+            merged_map[e["rel_path"]] = e
+        merged = list(merged_map.values())
 
-        merged = list(existing_by_key.values())
+        from collections import Counter
+        st = Counter(e.get("status", "?") for e in merged)
 
-        ok_count      = sum(1 for e in merged if e.get("status") == "ok")
-        pending_count = sum(1 for e in merged if e.get("status") == "pending")
-        error_count   = sum(1 for e in merged if e.get("status") == "error")
-        del_count     = sum(1 for e in merged if e.get("status") == "pending_delete")
-
-        complete = (pending_count == 0 and error_count == 0)
+        ok_total      = st["ok"]
+        pending_total = st["pending"] + st["ok_mac"] + st["ok_win"]
+        error_total   = st["error"]
+        del_total     = st["pending_delete"]
+        complete      = (pending_total == 0 and error_total == 0)
 
         report = {
             "meta": {
-                "created":       datetime.now().isoformat(),
-                "tool":          "file_harvester.py",
-                "version":       "2.0",
-                "directive":     str(self.directive_path),
-                "harvest_root":  str(self.harvest_root),
-                "complete":      complete,
-                "last_run":      ts,
+                "created":      datetime.now().isoformat(),
+                "tool":         "file_harvester.py",
+                "version":      "2.1",
+                "directive":    str(self.directive_path),
+                "harvest_root": str(self.harvest_root),
+                "complete":     complete,
+                "last_run":     ts,
             },
             "summary": {
-                "ok":             ok_count,
-                "pending":        pending_count,
-                "error":          error_count,
-                "pending_delete": del_count,
+                "ok":             ok_total,
+                "pending":        pending_total,
+                "error":          error_total,
+                "pending_delete": del_total,
                 "complete":       complete,
             },
             "entries": merged,
@@ -426,11 +436,8 @@ class Harvester:
             json.dumps(report, indent=2, ensure_ascii=False),
             encoding="utf-8"
         )
-
-        # Log
-        log_path = self.harvest_root / f"harvest_log_{ts}.txt"
-        # Log wird von GUI gesammelt – hier nur Report-Pfad zurück
-        self.on_done(report, report_path, log_path)
+        self.on_done(report, report_path,
+                     self.harvest_root / f"harvest_log_{ts}.txt")
 
 
 # ==============================================================================
@@ -441,8 +448,8 @@ class HarvesterApp:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("🌾 File Harvester v2")
-        self.root.geometry("860x760")
+        self.root.title("🌾 File Harvester v2.1")
+        self.root.geometry("900x800")
         self.root.resizable(True, True)
 
         self._directive:      dict | None = None
@@ -452,6 +459,7 @@ class HarvesterApp:
         self.cancel_event = threading.Event()
         self._log_lines:  list[str] = []
         self._errors:     list[str] = []
+        self._last_report: dict | None = None
 
         self._build_ui()
 
@@ -461,20 +469,18 @@ class HarvesterApp:
 
     def _build_ui(self):
         # Header
-        header = tk.Frame(self.root, bg="#1a5276", height=58)
+        header = tk.Frame(self.root, bg="#1a5276", height=56)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
         tk.Label(header, text="🌾 File Harvester – Dateien einsammeln",
-                 font=("Helvetica", 15, "bold"),
+                 font=("Helvetica", 14, "bold"),
                  bg="#1a5276", fg="white").pack(pady=14)
 
-        # Schritt 1 – USB wählen
-        usb_frame = tk.LabelFrame(
-            self.root,
-            text="Schritt 1 – USB-Laufwerk wählen",
-            padx=10, pady=8)
+        # Schritt 1 – USB
+        usb_frame = tk.LabelFrame(self.root,
+                                  text="Schritt 1 – USB-Laufwerk wählen",
+                                  padx=10, pady=6)
         usb_frame.pack(fill=tk.X, padx=10, pady=(8, 4))
-
         self.usb_display_var = tk.StringVar(value="(noch nicht gewählt)")
         tk.Label(usb_frame, textvariable=self.usb_display_var,
                  font=("Courier", 9), anchor="w",
@@ -485,32 +491,29 @@ class HarvesterApp:
                   bg="#1a5276", fg="white",
                   width=24).pack(side=tk.RIGHT)
 
-        # Schritt 2 – erkannte Directive + Harvest-Ordner
-        info_frame = tk.LabelFrame(
-            self.root,
-            text="Schritt 2 – Erkannte Konfiguration",
-            padx=10, pady=6)
+        # Schritt 2 – Konfiguration
+        info_frame = tk.LabelFrame(self.root,
+                                   text="Schritt 2 – Erkannte Konfiguration",
+                                   padx=10, pady=4)
         info_frame.pack(fill=tk.X, padx=10, pady=4)
 
         self.directive_display = tk.StringVar(value="–")
         self.harvest_display   = tk.StringVar(value="–")
         self.run_label_var     = tk.StringVar(value="–")
 
-        for label, var in [
-            ("Directive:",     self.directive_display),
-            ("Harvest-Ordner:", self.harvest_display),
-            ("Lauf-Status:",   self.run_label_var),
-        ]:
+        for label, var in [("Directive:",      self.directive_display),
+                            ("Harvest-Ordner:", self.harvest_display),
+                            ("Lauf-Status:",    self.run_label_var)]:
             row = tk.Frame(info_frame)
             row.pack(fill=tk.X, pady=1)
             tk.Label(row, text=label, width=16, anchor="w",
                      font=("Helvetica", 9, "bold")).pack(side=tk.LEFT)
             tk.Label(row, textvariable=var,
                      font=("Courier", 8), anchor="w",
-                     fg="#555").pack(side=tk.LEFT, fill=tk.X)
+                     fg="#333").pack(side=tk.LEFT, fill=tk.X)
 
-        # Zähler-Panel
-        cnt = tk.LabelFrame(self.root, text="Fortschritt", padx=10, pady=8)
+        # Fortschritt
+        cnt = tk.LabelFrame(self.root, text="Fortschritt", padx=10, pady=6)
         cnt.pack(fill=tk.X, padx=10, pady=4)
 
         self.progress_label = tk.Label(cnt, text="Bereit.",
@@ -522,57 +525,73 @@ class HarvesterApp:
         self.progress_bar = ttk.Progressbar(cnt, mode="determinate")
         self.progress_bar.pack(fill=tk.X, pady=(4, 6))
 
+        # Zähler-Kacheln (zeigen Gesamt aus Report)
         grid = tk.Frame(cnt)
         grid.pack(fill=tk.X)
         self._counter_vars = {}
         counter_defs = [
-            ("copy_mac",      "✅ COPY MAC",       "#2980b9"),
-            ("copy_win",      "✅ COPY WIN",       "#2980b9"),
-            ("copy_both",     "✅ COPY (beide)",   "#2980b9"),
-            ("conflict_mod",  "📋 CONFLICT mod",  "#e67e22"),
-            ("conflict_del",  "⚠️  CONFLICT del",  "#e67e22"),
-            ("delete_pending","🗑  DELETE pend",   "#c0392b"),
-            ("pending",       "⏳ Ausstehend",     "#7f8c8d"),
-            ("not_found",     "❌ Nicht gefunden", "#c0392b"),
+            ("copy_mac",         "✅ COPY MAC",        "#2980b9"),
+            ("copy_win",         "✅ COPY WIN",        "#2980b9"),
+            ("copy_both",        "✅ COPY (beide)",    "#2980b9"),
+            ("conflict_mod",     "📋 CONFLICT mod",   "#e67e22"),
+            ("conflict_partial", "📋 CONFLICT part",  "#e67e22"),
+            ("conflict_del",     "⚠️  CONFLICT del",   "#e67e22"),
+            ("delete_pending",   "🗑  DELETE (USB)",   "#7f8c8d"),
+            ("pending",          "⏳ Ausstehend",      "#7f8c8d"),
+            ("not_found",        "❌ Nicht gefunden",  "#c0392b"),
         ]
         for col, (key, label, color) in enumerate(counter_defs):
             var = tk.StringVar(value="0")
             self._counter_vars[key] = var
-            cell = tk.Frame(grid, relief=tk.GROOVE, bd=1, padx=4, pady=3)
+            cell = tk.Frame(grid, relief=tk.GROOVE, bd=1, padx=3, pady=3)
             cell.grid(row=0, column=col, padx=2, sticky="ew")
             grid.columnconfigure(col, weight=1)
             tk.Label(cell, text=label, font=("Helvetica", 7),
-                     fg=color, wraplength=80,
-                     justify="center").pack()
+                     fg=color, wraplength=78, justify="center").pack()
             tk.Label(cell, textvariable=var,
-                     font=("Helvetica", 12, "bold")).pack()
+                     font=("Helvetica", 11, "bold")).pack()
         self._counters = {k: 0 for k in self._counter_vars}
 
-        # Fehler-Panel (versteckt bis Fehler)
-        self.error_frame = tk.LabelFrame(
-            self.root, text="❌ Fehler / Nicht gefunden",
-            padx=8, pady=4)
-        self.error_listbox = tk.Listbox(
-            self.error_frame, font=("Courier", 8),
-            height=4, bg="#fff0f0")
+        # Notebook: Log + Gesamtübersicht
+        self.nb = ttk.Notebook(self.root)
+        self.nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+
+        # Tab 1: Log
+        log_frame = tk.Frame(self.nb)
+        self.nb.add(log_frame, text="Log")
+        self.log_text = tk.Text(log_frame, font=("Courier", 8),
+                                state=tk.DISABLED,
+                                bg="#1e1e1e", fg="#d4d4d4")
+        lsb = ttk.Scrollbar(log_frame, orient="vertical",
+                             command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=lsb.set)
+        lsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+        # Fehler-Listbox im Log-Tab (versteckt bis Fehler)
+        self.error_frame = tk.LabelFrame(log_frame,
+                                         text="❌ Fehler / Nicht gefunden",
+                                         padx=6, pady=4)
+        self.error_listbox = tk.Listbox(self.error_frame,
+                                        font=("Courier", 7),
+                                        height=4, bg="#fff0f0")
         esb = ttk.Scrollbar(self.error_frame, orient="vertical",
                              command=self.error_listbox.yview)
         self.error_listbox.configure(yscrollcommand=esb.set)
         esb.pack(side=tk.RIGHT, fill=tk.Y)
         self.error_listbox.pack(fill=tk.BOTH, expand=True)
 
-        # Log
-        log_frame = tk.LabelFrame(self.root, text="Log", padx=8, pady=4)
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
-        self.log_text = tk.Text(
-            log_frame, font=("Courier", 8),
-            state=tk.DISABLED, height=8,
-            bg="#1e1e1e", fg="#d4d4d4")
-        lsb = ttk.Scrollbar(log_frame, orient="vertical",
-                             command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=lsb.set)
-        lsb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        # Tab 2: Gesamtübersicht (wird nach Harvest befüllt)
+        self.overview_frame = tk.Frame(self.nb)
+        self.nb.add(self.overview_frame, text="Gesamtübersicht")
+        self.overview_text = tk.Text(self.overview_frame,
+                                     font=("Courier", 9),
+                                     state=tk.DISABLED)
+        osb = ttk.Scrollbar(self.overview_frame, orient="vertical",
+                             command=self.overview_text.yview)
+        self.overview_text.configure(yscrollcommand=osb.set)
+        osb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.overview_text.pack(fill=tk.BOTH, expand=True)
 
         # Statusleiste
         self.status_var = tk.StringVar(value="Bereit.")
@@ -596,20 +615,27 @@ class HarvesterApp:
             btn_frame, text="⏹ Abbrechen",
             command=self._cancel,
             font=("Helvetica", 12),
-            state=tk.DISABLED, height=2, width=15)
+            state=tk.DISABLED, height=2, width=14)
         self.cancel_btn.pack(side=tk.LEFT, padx=5)
 
         self.log_btn = tk.Button(
             btn_frame, text="📋 Log öffnen",
             command=self._open_log,
             font=("Helvetica", 12),
-            state=tk.DISABLED, height=2, width=15)
+            state=tk.DISABLED, height=2, width=14)
         self.log_btn.pack(side=tk.LEFT, padx=5)
+
+        self.overview_btn = tk.Button(
+            btn_frame, text="📊 Übersicht",
+            command=lambda: self.nb.select(self.overview_frame),
+            font=("Helvetica", 12),
+            state=tk.DISABLED, height=2, width=14)
+        self.overview_btn.pack(side=tk.LEFT, padx=5)
 
         self._log_path = None
 
     # ------------------------------------------------------------------
-    # USB wählen → alles ableiten
+    # USB wählen
     # ------------------------------------------------------------------
 
     def _pick_usb(self):
@@ -626,41 +652,33 @@ class HarvesterApp:
         if not sync.is_dir():
             messagebox.showwarning(
                 "Kein _sync-Ordner",
-                f"Kein _sync-Ordner gefunden auf:\n{self._usb_root}\n\n"
-                f"Bitte zuerst Script 1 + 2 ausführen."
-            )
+                f"Kein _sync-Ordner gefunden:\n{self._usb_root}\n\n"
+                f"Bitte zuerst Script 1 + 2 ausführen.")
             return
 
-        # Neuestes Datum-Unterverzeichnis
-        dated = sorted([d for d in sync.iterdir() if d.is_dir()], reverse=True)
+        dated = sorted([d for d in sync.iterdir() if d.is_dir()],
+                       reverse=True)
         if not dated:
             messagebox.showwarning("Kein Datum-Ordner",
                                    f"_sync enthält keine Unterordner:\n{sync}")
             return
 
         sync_dir = dated[0]
-
-        # Neueste Directive suchen
-        directives = sorted(
-            sync_dir.glob("change_directive_*.json"), reverse=True
-        )
-        # Bereits geharveste überspringen
+        directives = sorted(sync_dir.glob("change_directive_*.json"),
+                            reverse=True)
         directives = [d for d in directives if "_harvested" not in d.name]
 
         if not directives:
             messagebox.showwarning(
                 "Keine Directive",
                 f"Keine change_directive_*.json in:\n{sync_dir}\n\n"
-                f"Bitte zuerst Script 2 ausführen."
-            )
+                f"Bitte Script 2 ausführen.")
             return
 
         directive_path = directives[0]
-
         try:
             directive = json.loads(
-                directive_path.read_text(encoding="utf-8")
-            )
+                directive_path.read_text(encoding="utf-8"))
         except Exception as exc:
             messagebox.showerror("Lesefehler", str(exc))
             return
@@ -669,38 +687,41 @@ class HarvesterApp:
         self._directive_path = directive_path
         self._harvest_root   = sync_dir / "harvest"
 
-        # Lauf-Status ermitteln
+        # Lauf-Status
         report_path = self._harvest_root / "harvest_report.json"
         if report_path.is_file():
             try:
-                rep = json.loads(report_path.read_text(encoding="utf-8"))
-                ok      = rep["summary"].get("ok", 0)
-                pending = rep["summary"].get("pending", 0)
+                rep      = json.loads(report_path.read_text(encoding="utf-8"))
+                ok       = rep["summary"].get("ok", 0)
+                pending  = rep["summary"].get("pending", 0)
                 complete = rep["summary"].get("complete", False)
                 if complete:
-                    run_status = f"✅ Lauf 1 vollständig – {ok} OK, 0 ausstehend"
+                    run_str = f"✅ Harvest vollständig – {ok:,} OK"
                 else:
-                    run_status = (f"⏳ Lauf 2 – {ok} bereits erledigt, "
-                                  f"{pending} noch ausstehend")
+                    run_str = (f"⏳ Lauf wird fortgesetzt – "
+                               f"{ok:,} erledigt, {pending:,} ausstehend")
+                self._last_report = rep
             except Exception:
-                run_status = "Lauf 1 (Report nicht lesbar)"
+                run_str = "Report nicht lesbar – Lauf 1"
         else:
-            # Einträge zählen die bearbeitet werden müssen
             n = sum(1 for e in directive.get("entries", [])
-                    if e["action"] in HARVEST_ACTIONS and e["action"] != A_OK)
-            run_status = f"Lauf 1 – {n} Einträge zu verarbeiten"
+                    if e["action"] in HARVEST_ACTIONS)
+            run_str = f"Lauf 1 – {n:,} Einträge zu verarbeiten"
 
-        # Anzeige aktualisieren
         self.usb_display_var.set(
-            f"✔  {self._usb_root}  →  _sync/{sync_dir.name}/"
-        )
+            f"✔  {self._usb_root}  →  _sync/{sync_dir.name}/")
         self.directive_display.set(directive_path.name)
         self.harvest_display.set(str(self._harvest_root))
-        self.run_label_var.set(run_status)
+        self.run_label_var.set(run_str)
         self.start_btn.config(state=tk.NORMAL)
-        self._append_log(f"USB erkannt: {self._usb_root}")
-        self._append_log(f"Directive:   {directive_path.name}")
-        self._append_log(f"Status:      {run_status}")
+
+        self._append_log(f"USB: {self._usb_root}")
+        self._append_log(f"Directive: {directive_path.name}")
+        self._append_log(f"Status: {run_str}")
+
+        # Wenn bereits complete: Übersicht sofort anzeigen
+        if self._last_report and self._last_report["summary"].get("complete"):
+            self._build_overview(self._last_report)
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -712,14 +733,15 @@ class HarvesterApp:
             self.progress_label.config(
                 text=f"Verarbeite {current:,} / {total:,}  [{pct}%]"),
             self.file_label.config(
-                text=f"  {action:<24s}  {filename[-68:]}"),
+                text=f"  {action:<26s}  {filename[-65:]}"),
             self.progress_bar.config(value=pct),
         ])
 
     def _cb_counter(self, name, delta):
         self._counters[name] = self._counters.get(name, 0) + delta
         val = str(self._counters[name])
-        self.root.after(0, lambda: self._counter_vars[name].set(val))
+        self.root.after(0, lambda v=val, n=name:
+                        self._counter_vars[n].set(v))
 
     def _cb_error(self, rel, reason):
         msg = f"{rel}  →  {reason}"
@@ -727,8 +749,8 @@ class HarvesterApp:
 
         def _upd():
             if not self.error_frame.winfo_ismapped():
-                self.error_frame.pack(fill=tk.X, padx=10, pady=2,
-                                      before=self.log_text.master)
+                self.error_frame.pack(fill=tk.X, padx=4, pady=2,
+                                      before=self.log_text)
             self.error_listbox.insert(tk.END, msg)
             self.error_listbox.see(tk.END)
 
@@ -740,68 +762,177 @@ class HarvesterApp:
         self._append_log(msg)
 
     def _cb_done(self, report, report_path, log_path):
-        s = report["summary"]
+        s        = report["summary"]
         complete = s.get("complete", False)
+        self._last_report = report
 
         # Log speichern
         ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        log_path = self._harvest_root / f"harvest_log_{ts}.txt"
+        lp = self._harvest_root / f"harvest_log_{ts}.txt"
         try:
-            log_path.write_text("\n".join(self._log_lines), encoding="utf-8")
+            lp.write_text("\n".join(self._log_lines), encoding="utf-8")
         except Exception:
             pass
-        self._log_path = log_path
+        self._log_path = lp
 
         def _upd():
             self.start_btn.config(state=tk.NORMAL)
             self.cancel_btn.config(state=tk.DISABLED)
             self.log_btn.config(state=tk.NORMAL)
+            self.overview_btn.config(state=tk.NORMAL)
             self.progress_bar.config(value=100)
 
+            # Zähler aus Report aktualisieren (Gesamt-Stand)
+            self._update_counters_from_report(report)
+
+            # Übersicht aufbauen
+            self._build_overview(report)
+
             if complete:
-                msg = (f"✅ HARVEST COMPLETE – "
-                       f"{s['ok']} OK  |  "
-                       f"{s['pending_delete']} DELETE ausstehend")
+                msg = (f"✅ HARVEST COMPLETE – {s['ok']:,} OK  |  "
+                       f"{s['pending_delete']:,} Dateien auf USB "
+                       f"warten auf Lösch-Bestätigung (Script 4)")
                 self.progress_label.config(text=msg, fg="#27ae60")
-                self.status_var.set(msg)
+                self.status_var.set("✅ Harvest abgeschlossen")
                 messagebox.showinfo(
                     "Harvest abgeschlossen",
-                    f"Alle Einträge erledigt!\n\n"
-                    f"  OK:              {s['ok']:,}\n"
-                    f"  DELETE ausstehend: {s['pending_delete']:,}\n\n"
-                    f"Bereit für Script 4 (change_execution.py)."
+                    f"Alle Einträge eingesammelt!\n\n"
+                    f"  OK (kopiert):          {s['ok']:,}\n"
+                    f"  Auf USB-Löschung wart.: {s['pending_delete']:,}\n\n"
+                    f"Die {s['pending_delete']:,} Dateien liegen noch auf USB\n"
+                    f"und werden erst in Script 4 nach Bestätigung entfernt.\n\n"
+                    f"→ Gesamtübersicht-Tab für Details.\n"
+                    f"→ Bereit für Script 4 (change_execution.py)."
                 )
-                # Directive umbenennen → _harvested
                 try:
                     new_name = self._directive_path.stem + "_harvested.json"
                     self._directive_path.rename(
-                        self._directive_path.parent / new_name
-                    )
-                    self._append_log(f"Directive umbenannt → {new_name}")
+                        self._directive_path.parent / new_name)
+                    self._append_log(f"Directive → {new_name}")
                 except Exception as exc:
-                    self._append_log(f"Umbenennen fehlgeschlagen: {exc}")
-
+                    self._append_log(f"Umbenennen: {exc}")
             else:
-                msg = (f"⏳ Lauf abgeschlossen – "
-                       f"{s['ok']} OK  |  "
-                       f"{s['pending']} noch ausstehend  |  "
-                       f"{s['error']} Fehler")
+                pending  = s.get("pending", 0)
+                errors   = s.get("error", 0)
+                msg = (f"⏳ Lauf abgeschlossen – {s['ok']:,} OK  |  "
+                       f"{pending:,} ausstehend  |  {errors:,} Fehler")
                 self.progress_label.config(text=msg, fg="#e67e22")
                 self.status_var.set(msg)
-                messagebox.showinfo(
-                    "Lauf abgeschlossen",
-                    f"Erster Lauf abgeschlossen.\n\n"
-                    f"  Erledigt:     {s['ok']:,}\n"
-                    f"  Ausstehend:   {s['pending']:,}\n"
-                    f"  Fehler:       {s['error']:,}\n\n"
-                    f"Bitte USB nun an den anderen Rechner anschließen\n"
-                    f"und Harvester dort erneut starten."
-                )
+                hint = ("Bitte USB an den anderen Rechner anschließen\n"
+                        "und Harvester dort erneut starten.")
+                messagebox.showinfo("Lauf abgeschlossen",
+                    f"Lauf abgeschlossen.\n\n"
+                    f"  Erledigt:    {s['ok']:,}\n"
+                    f"  Ausstehend:  {pending:,}\n"
+                    f"  Fehler:      {errors:,}\n\n"
+                    f"{hint}")
 
         self.root.after(0, _upd)
 
+    def _update_counters_from_report(self, report: dict):
+        """Setzt Zähler-Kacheln auf Gesamt-Stand aus Report."""
+        from collections import Counter
+        entries = report.get("entries", [])
+        actions = Counter(e.get("action") for e in entries
+                          if e.get("status") == "ok")
+        mapping = {
+            A_COPY_MAC:     "copy_mac",
+            A_COPY_WIN:     "copy_win",
+            A_COPY:         "copy_both",
+            A_CONF_MOD:     "conflict_mod",
+            A_CONF_DEL_WIN: "conflict_del",
+            A_CONF_DEL_MAC: "conflict_del",
+        }
+        for action, key in mapping.items():
+            self._counters[key] = (self._counters.get(key, 0)
+                                   + actions.get(action, 0))
+        self._counters["delete_pending"] = sum(
+            1 for e in entries if e.get("status") == "pending_delete")
+        self._counters["pending"] = report["summary"].get("pending", 0)
+        for key, var in self._counter_vars.items():
+            var.set(str(self._counters.get(key, 0)))
+
+    def _build_overview(self, report: dict):
+        """Baut den Gesamtübersicht-Tab mit Dateianzahl und Größen."""
+        if not self._harvest_root:
+            return
+
+        lines = []
+        lines.append("=" * 62)
+        lines.append("  HARVEST GESAMTÜBERSICHT")
+        lines.append(f"  Stand: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        lines.append("=" * 62)
+        lines.append("")
+
+        # Report-Zusammenfassung
+        s = report["summary"]
+        lines.append(f"  Eingesammelt (OK):          {s['ok']:>7,}")
+        lines.append(f"  Ausstehend:                 {s.get('pending',0):>7,}")
+        lines.append(f"  Fehler:                     {s.get('error',0):>7,}")
+        lines.append(f"  Auf USB-Löschbestätigung:   {s['pending_delete']:>7,}")
+        lines.append(f"  Harvest vollständig:        "
+                     f"{'Ja ✅' if s.get('complete') else 'Nein ⏳'}")
+        lines.append("")
+        lines.append("-" * 62)
+        lines.append("  ORDNER AUF USB (tatsächliche Dateien + Größen)")
+        lines.append("-" * 62)
+
+        # Ordner-Statistiken berechnen (in Thread würde besser sein,
+        # aber Übersicht wird nur einmal aufgebaut)
+        categories = [
+            ("staging/mac",             "COPY MAC    → auf Win + USB verteilen"),
+            ("staging/win",             "COPY WIN    → auf Mac + USB verteilen"),
+            ("staging/both",            "COPY beide  → auf USB verteilen"),
+            ("conflicts",               "CONFLICT modified  → Script 4 entscheidet"),
+            ("_GELOESCHT",              "Gesicherte Löschungen (Sicherheitskopie)"),
+            ("_GELOESCHT/2026-06-16/del_win",
+             "  del_win → Win hat gelöscht (Mac unverändert)"),
+            ("_GELOESCHT/2026-06-16/del_mac",
+             "  del_mac → Mac hat gelöscht (Win unverändert)"),
+        ]
+
+        for rel, desc in categories:
+            folder = self._harvest_root / rel
+            if folder.is_dir():
+                # Schnelle Schätzung über os.scandir statt rglob
+                count, total_b = 0, 0
+                try:
+                    for dirpath, _, filenames in os.walk(str(folder)):
+                        for fn in filenames:
+                            try:
+                                fp = os.path.join(dirpath, fn)
+                                total_b += os.path.getsize(fp)
+                                count += 1
+                            except OSError:
+                                pass
+                except Exception:
+                    pass
+                lines.append(
+                    f"  {desc}")
+                lines.append(
+                    f"  {'':>4}{count:>7,} Dateien   {fmt_size(total_b):>10}")
+            else:
+                lines.append(f"  {desc}")
+                lines.append(f"  {'':>4}(leer / nicht vorhanden)")
+            lines.append("")
+
+        lines.append("-" * 62)
+        lines.append("  NÄCHSTE SCHRITTE")
+        lines.append("-" * 62)
+        lines.append("  1. Script 4 (change_execution.py) starten")
+        lines.append("  2. COPY-Dateien werden automatisch verteilt")
+        lines.append("  3. Löschungen bestätigen oder rückgängig machen")
+        lines.append("  4. CONFLICT modified: Versionen vergleichen + entscheiden")
+        lines.append("")
+
+        self.overview_text.config(state=tk.NORMAL)
+        self.overview_text.delete("1.0", tk.END)
+        self.overview_text.insert(tk.END, "\n".join(lines))
+        self.overview_text.config(state=tk.DISABLED)
+        self.nb.select(self.overview_frame)
+
     def _append_log(self, msg: str):
-        ts = datetime.now().strftime("%H:%M:%S")
+        ts   = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}\n"
 
         def _upd():
@@ -818,10 +949,10 @@ class HarvesterApp:
 
     def _start(self):
         if not self._directive or not self._harvest_root:
-            messagebox.showerror("Fehler", "Bitte zuerst USB-Laufwerk wählen.")
+            messagebox.showerror("Fehler",
+                                 "Bitte zuerst USB-Laufwerk wählen.")
             return
 
-        # Reset Zähler + Log
         self.cancel_event.clear()
         self._errors.clear()
         self._log_lines.clear()
@@ -833,10 +964,12 @@ class HarvesterApp:
         self.log_text.config(state=tk.DISABLED)
         self.error_listbox.delete(0, tk.END)
         self.progress_bar.config(value=0)
+        self.progress_label.config(fg="black")
 
         self.start_btn.config(state=tk.DISABLED)
         self.cancel_btn.config(state=tk.NORMAL)
         self.log_btn.config(state=tk.DISABLED)
+        self.overview_btn.config(state=tk.DISABLED)
         self.status_var.set("⏳ Harvest läuft …")
 
         harvester = Harvester(
@@ -849,9 +982,8 @@ class HarvesterApp:
             on_log            = self._cb_log,
             on_done           = self._cb_done,
             cancel_event      = self.cancel_event,
-            usb_root_override = self._usb_root,   # H:\ oder /Volumes/... je nach System
+            usb_root_override = self._usb_root,
         )
-
         threading.Thread(target=harvester.run, daemon=True).start()
 
     def _cancel(self):
@@ -862,10 +994,10 @@ class HarvesterApp:
     def _open_log(self):
         if self._log_path and self._log_path.is_file():
             import subprocess, platform
-            sys_name = platform.system()
-            if sys_name == "Darwin":
+            s = platform.system()
+            if s == "Darwin":
                 subprocess.Popen(["open", str(self._log_path)])
-            elif sys_name == "Windows":
+            elif s == "Windows":
                 subprocess.Popen(["notepad", str(self._log_path)])
             else:
                 subprocess.Popen(["xdg-open", str(self._log_path)])
