@@ -522,7 +522,7 @@ def cli_mode(folders: list[str], output: str = None):
         python current_journal.py --cli /path/to/Photos /path/to/Videos
     """
     folder_paths = [Path(f) for f in folders]
-    output_path = Path(output) if output else Path.cwd() / JOURNAL_FILENAME
+    output_path = Path(output) if output else Path.cwd() # JOURNAL_FILENAME
 
     print(f"📁 Current Journal - {DEVICE_NAME}")
     print(f"{'='*60}")
