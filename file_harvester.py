@@ -213,6 +213,11 @@ class Harvester:
         entries = [e for e in self.directive.get("entries", [])
                    if e["action"] in HARVEST_ACTIONS]
 
+        # Bestehenden Report laden – nötig um pro-Slot-Status (mac/win)
+        # für CONFLICT-Einträge nachzuschlagen. Die Directive selbst
+        # trägt nie einen "status" — der lebt ausschließlich im Report.
+        prior_status = self._load_prior_status()
+
         done_keys = self._load_done_keys()
         pending   = [e for e in entries if e["rel_path"] not in done_keys]
 
@@ -237,8 +242,9 @@ class Harvester:
             # CONFLICT modified / new – je Slot einzeln verfolgen
             # ----------------------------------------------------------
             if act in (A_CONF_MOD, A_CONF_NEW):
-                mac_done = entry.get("status") in ("ok_mac", "ok")
-                win_done = entry.get("status") in ("ok_win", "ok")
+                prior = prior_status.get(rel, {})
+                mac_done = prior.get("status") in ("ok_mac", "ok")
+                win_done = prior.get("status") in ("ok_win", "ok")
 
                 result = {"rel_path": rel, "action": act,
                           "presence": pres, "slots": {}}
@@ -360,6 +366,23 @@ class Harvester:
             "status": "pending", "reason": f"{slot} nicht erreichbar",
         })
         self.on_counter("pending", 1)
+
+    def _load_prior_status(self) -> dict[str, dict]:
+        """
+        Liest den bestehenden harvest_report und gibt eine Map
+        rel_path → Report-Eintrag zurück. Wird gebraucht weil die
+        Directive selbst NIE ein 'status'-Feld trägt (das lebt nur
+        im Report) — frühere Versionen lasen fälschlich vom
+        Directive-Eintrag, was 'status' immer None ergab.
+        """
+        report_path = self.harvest_root / "harvest_report.json"
+        if not report_path.is_file():
+            return {}
+        try:
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            return {e["rel_path"]: e for e in data.get("entries", [])}
+        except Exception:
+            return {}
 
     def _load_done_keys(self) -> set[str]:
         """
