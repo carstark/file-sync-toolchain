@@ -487,16 +487,31 @@ class Executor:
         return None
 
     def _all_copy_done(self) -> bool:
-        """True wenn alle COPY MAC→Win und COPY WIN→Mac erledigt sind."""
-        m = self.machine
+        """
+        True wenn alle COPY MAC→Win, COPY WIN→Mac UND alle CONFLICT
+        modified/new-Einträge auf BEIDEN Plattformen (mac+win) lokal
+        bereitgestellt sind. CONFLICT-Einträge brauchen IMMER beide
+        Seiten — unabhängig davon welche Maschine gerade den Check macht —
+        sonst meldet 'complete' fälschlich True, wenn z.B. diese Runde
+        gar keine COPY-Einträge offen hatte (copy_mac/copy_win == 0),
+        aber CONFLICTs auf der jeweils ANDEREN Plattform noch ausstehen.
+        """
         for e in self.entries:
             act, st = e.get("action",""), e.get("status","")
-            if st != "ok": continue
-            if act == "COPY MAC" and m == "win":
-                if not self.er.is_done(f"{e['rel_path']}::local::win"):
+            if st != "ok":
+                continue
+            rel = e["rel_path"]
+            if act == "COPY MAC":
+                if not self.er.is_done(f"{rel}::local::win"):
                     return False
-            elif act == "COPY WIN" and m == "mac":
-                if not self.er.is_done(f"{e['rel_path']}::local::mac"):
+            elif act == "COPY WIN":
+                if not self.er.is_done(f"{rel}::local::mac"):
+                    return False
+            elif act in ("CONFLICT modified", "CONFLICT new"):
+                # Braucht IMMER beide Seiten, unabhängig von self.machine
+                if not self.er.is_done(f"{rel}::local::mac"):
+                    return False
+                if not self.er.is_done(f"{rel}::local::win"):
                     return False
         return True
 
