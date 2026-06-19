@@ -217,6 +217,7 @@ def compare_journals(journals: dict[str, dict]) -> dict:
         all_paths.update(files.keys())
 
     entries = []
+    ok_count = 0   # separat gezählt, nicht in entries gespeichert
 
     for rel_path in sorted(all_paths):
         presence   = {slot: (rel_path in flat[slot]) for slot in slot_names}
@@ -224,6 +225,13 @@ def compare_journals(journals: dict[str, dict]) -> dict:
                       for slot in slot_names if rel_path in flat[slot]}
 
         action = classify(presence, per_source, has_usb)
+
+        # OK-Einträge (identisch auf allen Quellen) werden NICHT gespeichert —
+        # Script 3/4 verarbeiten sie ohnehin nicht, und bei >300k Dateien
+        # macht das die Directive unnötig riesig (waren bis zu 200+ MB).
+        if action == A_OK:
+            ok_count += 1
+            continue
 
         entry = {
             "rel_path":        rel_path,
@@ -236,9 +244,9 @@ def compare_journals(journals: dict[str, dict]) -> dict:
         entries.append(entry)
 
     # Zusammenfassung
-    all_actions = [e["action"] for e in entries]
+    all_actions = [e["action"] for e in entries] + [A_OK] * ok_count
     summary = {
-        "total_files":      len(entries),
+        "total_files":      len(all_paths),
         "ok":               all_actions.count(A_OK),
         "copy_mac":         all_actions.count(A_COPY_MAC),
         "copy_win":         all_actions.count(A_COPY_WIN),
