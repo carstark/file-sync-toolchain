@@ -78,11 +78,33 @@ def sha256(path: Path, chunk: int = 1 << 20) -> str:
 
 
 def copy_verified(src: Path, dst: Path) -> tuple[bool, str]:
+    # Symlink-Quellen explizit auflösen, bevor kopiert wird.
+    # Grund: shutil.copy2() nutzt auf macOS intern die native copyfile()-
+    # Syscall-Optimierung, die Symlinks am Ziel reproduzieren kann statt
+    # sie aufzulösen — selbst mit follow_symlinks=True (Python-Default).
+    # Das tritt z.B. bei Apple Photos/iPhoto-Mediatheken auf, die interne
+    # Datenbank-Dateien zwischen migrierten Bibliotheksversionen verlinken.
+    try:
+        if src.is_symlink() or os.path.islink(str(src)):
+            resolved = os.path.realpath(str(src))
+            if os.path.isfile(resolved):
+                src = Path(resolved)
+    except Exception:
+        pass
+
     src_lp = longpath(src)
     dst_lp = longpath(dst)
     dst_lp.parent.mkdir(parents=True, exist_ok=True)
     try:
         shutil.copy2(str(src_lp), str(dst_lp))
+        # Falls trotzdem ein Symlink am Ziel entstand: erneut auflösen
+        # und tatsächlichen Inhalt nachträglich an dieselbe Stelle schreiben.
+        if dst_lp.is_symlink() or os.path.islink(str(dst_lp)):
+            real_target = os.path.realpath(str(dst_lp))
+            if os.path.isfile(real_target) and real_target != str(dst_lp):
+                content = Path(real_target).read_bytes()
+                dst_lp.unlink()
+                dst_lp.write_bytes(content)
         h_src = sha256(src_lp)
         h_dst = sha256(dst_lp)
         if h_src != h_dst:
