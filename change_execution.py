@@ -50,23 +50,55 @@ def find_file(base, rel: str) -> Path | None:
     Sucht base/rel als Datei.
     Versucht NFC und NFD — nötig weil Mac HFS+ NFD liefert,
     exFAT aber NFC speichert (und umgekehrt).
+    Erkennt auch Symlinks (z.B. macOS Photos/iPhoto-Mediatheken
+    verlinken oft interne Datenbank-Dateien statt sie zu duplizieren) —
+    os.path.isfile() folgt Symlinks normalerweise, aber bei manchen
+    exFAT-Edge-Cases meldet es False obwohl die Datei via os.path.exists
+    durchaus aufgelöst werden kann. Daher zusätzlicher exists()-Check
+    mit anschließender realpath-Auflösung.
     """
     for norm in ["NFC", "NFD"]:
         r   = unicodedata.normalize(norm, rel)
         s   = os.path.join(str(base), *r.replace("\\", "/").split("/"))
         try:
-            if os.path.isfile(s):            return Path(s)
-            if _IS_WIN and os.path.isfile(_lp(s)): return Path(_lp(s))
+            if os.path.isfile(s):
+                return Path(s)
+            if _IS_WIN and os.path.isfile(_lp(s)):
+                return Path(_lp(s))
+            # Symlink-Fallback: existiert der Pfad überhaupt (auch als Link)?
+            if os.path.islink(s) or os.path.exists(s):
+                resolved = os.path.realpath(s)
+                if os.path.isfile(resolved):
+                    return Path(resolved)
         except Exception:
             pass
     return None
 
 def copy_file(src, dst) -> tuple[bool, str]:
     """Kopiert src→dst mit SHA256-Verifikation. Vollständig String-basiert."""
+    # Symlink-Quellen auflösen — macOS' native copyfile()-Optimierung in
+    # shutil kann Symlinks am Ziel reproduzieren statt sie aufzulösen.
+    try:
+        if os.path.islink(str(src)):
+            resolved = os.path.realpath(str(src))
+            if os.path.isfile(resolved):
+                src = resolved
+    except Exception:
+        pass
+
     ss, ds = _lp(str(src)), _lp(str(dst))
     try:
         os.makedirs(_lp(str(Path(str(dst)).parent)), exist_ok=True)
         shutil.copy2(ss, ds)
+        # Falls trotzdem ein Symlink am Ziel entstand: nachträglich aufloesen
+        if os.path.islink(ds):
+            real_target = os.path.realpath(ds)
+            if os.path.isfile(real_target) and real_target != ds:
+                with open(real_target, "rb") as f:
+                    content = f.read()
+                os.unlink(ds)
+                with open(ds, "wb") as f:
+                    f.write(content)
         if _sha256(ss) != _sha256(ds):
             try: os.unlink(ds)
             except: pass
